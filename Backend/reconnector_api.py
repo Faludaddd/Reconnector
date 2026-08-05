@@ -284,13 +284,24 @@ def fast_disconnect_checker():
 # ============================================================
 # HTTP SERVER
 # ============================================================
+# Status cache - prevents running expensive rish commands on every request
+_status_cache = {"data": None, "ts": 0}
+_STATUS_CACHE_TTL = 3  # 3 seconds
+
 def get_status_dict():
+    # Use cached data if less than 3 seconds old
+    now = time.time()
+    if _status_cache["data"] and (now - _status_cache["ts"]) < _STATUS_CACHE_TTL:
+        return _status_cache["data"]
+    
     battery = get_battery_sync()
     sys_info = get_system_info_sync()
     pid = get_roblox_pid_sync()
+    # Only check internet if we haven't recently (it's slow)
     online = has_internet_sync()
-    elapsed = int(time.time() - state.bot_first_start_time)
-    return {
+    elapsed = int(now - state.bot_first_start_time)
+    
+    data = {
         "roblox_state": state.roblox_state,
         "roblox_running": bool(pid),
         "battery": battery,
@@ -318,16 +329,23 @@ def get_status_dict():
             "no_bluetooth": state.opt_no_bluetooth,
         }
     }
+    
+    _status_cache["data"] = data
+    _status_cache["ts"] = now
+    return data
 
 class RequestHandler(BaseHTTPRequestHandler):
     def _send_json(self, data, code=200):
-        self.send_response(code)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode('utf-8'))
+        try:
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode('utf-8'))
+        except (ConnectionResetError, BrokenPipeError):
+            pass  # Client disconnected before we could respond - ignore
 
     def _read_body(self):
         content_length = int(self.headers.get('Content-Length', 0))
