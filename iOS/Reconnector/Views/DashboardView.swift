@@ -6,57 +6,89 @@ struct DashboardView: View {
     var body: some View {
         NavigationView {
             ScrollView {
-                VStack(spacing: 20) {
+                VStack(spacing: 24) {
                     if let status = appState.status {
                         // Status Card
-                        VStack(spacing: 12) {
+                        VStack(spacing: 16) {
                             Image(systemName: statusIcon(for: status.roblox_state))
-                                .font(.system(size: 40))
+                                .font(.system(size: 48))
                                 .foregroundColor(statusColor(for: status.roblox_state))
                             
                             Text(status.roblox_state.capitalized)
                                 .font(.title2)
                                 .fontWeight(.bold)
                             
-                            Text(status.roblox_running ? "Roblox Running" : "Roblox Not Running")
+                            Text(status.roblox_running ? "Roblox is running" : "Roblox is not running")
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
                         }
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 24)
+                        .padding(.vertical, 32)
+                        .padding(.horizontal, 24)
                         .background(Color(UIColor.secondarySystemBackground))
-                        .cornerRadius(16)
+                        .cornerRadius(20)
                         
                         // Stats Grid
-                        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 16) {
+                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 16), GridItem(.flexible(), spacing: 16)], spacing: 16) {
                             StatCard(title: "Battery", value: "\(status.battery)%", icon: "battery.100", color: .green)
                             StatCard(title: "CPU Temp", value: status.cpu_temp != nil ? String(format: "%.1f°C", status.cpu_temp!) : "N/A", icon: "thermometer", color: .orange)
                             StatCard(title: "Crashes", value: "\(status.crashes_today)", icon: "exclamationmark.triangle", color: .red)
                             StatCard(title: "Kicks", value: "\(status.kicks_today)", icon: "hand.raised", color: .yellow)
                         }
+                        .padding(.horizontal, 4)
                         
-                        // System Info
-                        VStack(alignment: .leading, spacing: 12) {
+                        // System Info Card
+                        VStack(alignment: .leading, spacing: 16) {
+                            Text("System Information")
+                                .font(.headline)
+                            
+                            Divider()
+                            
                             InfoRow(label: "Watchdog", value: status.watchdog_enabled ? "Active" : "Off", color: status.watchdog_enabled ? .green : .red)
                             InfoRow(label: "Interval", value: "\(status.interval) min", color: .blue)
                             InfoRow(label: "Brightness", value: "\(status.brightness)%", color: .yellow)
+                            
                             if let lastCrash = status.last_crash_reason, lastCrash != "-" {
+                                Divider()
                                 InfoRow(label: "Last Crash", value: lastCrash, color: .red)
                             }
+                            
+                            if let lastReconnect = status.last_reconnect, lastReconnect > 0 {
+                                InfoRow(label: "Last Reconnect", value: timeAgo(timestamp: lastReconnect), color: .secondary)
+                            }
                         }
-                        .padding()
+                        .padding(20)
                         .background(Color(UIColor.secondarySystemBackground))
-                        .cornerRadius(16)
+                        .cornerRadius(20)
                     } else {
-                        VStack(spacing: 16) {
+                        // Loading State
+                        VStack(spacing: 20) {
+                            Spacer()
+                                .frame(height: 60)
+                            
                             ProgressView()
-                            Text("Connecting to bot...")
+                                .scaleEffect(1.5)
+                            
+                            Text(appState.connectionError ?? "Connecting to backend...")
+                                .font(.subheadline)
                                 .foregroundColor(.secondary)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 40)
+                            
+                            if let error = appState.connectionError {
+                                Button("Retry Connection") {
+                                    appState.connectWebSocket()
+                                }
+                                .buttonStyle(.bordered)
+                                .padding(.top, 8)
+                            }
                         }
-                        .padding(.top, 100)
+                        .frame(maxWidth: .infinity)
                     }
                 }
-                .padding()
+                .padding(.horizontal, 20)
+                .padding(.top, 8)
+                .padding(.bottom, 40)
             }
             .navigationTitle("Dashboard")
             .refreshable { await appState.fetchStatus() }
@@ -82,6 +114,13 @@ struct DashboardView: View {
         default: return "questionmark.circle.fill"
         }
     }
+    
+    private func timeAgo(timestamp: Int) -> String {
+        let date = Date(timeIntervalSince1970: TimeInterval(timestamp))
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
 }
 
 struct StatCard: View {
@@ -91,21 +130,23 @@ struct StatCard: View {
     let color: Color
     
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 12) {
             Image(systemName: icon)
-                .font(.title2)
+                .font(.title)
                 .foregroundColor(color)
+            
             Text(value)
-                .font(.headline)
+                .font(.title3)
                 .fontWeight(.bold)
+            
             Text(title)
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
-        .frame(maxWidth: .infinity)
-        .padding()
+        .frame(maxWidth: .infinity, minHeight: 100)
+        .padding(16)
         .background(Color(UIColor.secondarySystemBackground))
-        .cornerRadius(12)
+        .cornerRadius(16)
     }
 }
 

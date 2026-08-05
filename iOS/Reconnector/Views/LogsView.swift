@@ -5,32 +5,67 @@ struct LogsView: View {
     
     var body: some View {
         NavigationView {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(appState.logs) { entry in
-                            Text(entry.text)
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundColor(colorForLog(entry.text))
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .id(entry.id)
-                        }
+            VStack(spacing: 0) {
+                if appState.logs.isEmpty {
+                    VStack(spacing: 16) {
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .font(.system(size: 40))
+                            .foregroundColor(.secondary)
+                        Text("No logs yet")
+                            .font(.headline)
+                        Text("Logs will appear here in real-time once connected.")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 40)
                     }
-                    .padding()
-                }
-                .onChange(of: appState.logs.count) { _ in
-                    if let last = appState.logs.last {
-                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 4) {
+                                ForEach(appState.logs) { entry in
+                                    HStack(alignment: .top, spacing: 8) {
+                                        Text(timeString(entry.timestamp))
+                                            .font(.system(.caption2, design: .monospaced))
+                                            .foregroundColor(.secondary)
+                                        
+                                        Text(entry.text)
+                                            .font(.system(.caption, design: .monospaced))
+                                            .foregroundColor(colorForLog(entry.text))
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 2)
+                                    .id(entry.id)
+                                }
+                            }
+                            .padding(.vertical, 8)
+                        }
+                        .onChange(of: appState.logs.count) { _ in
+                            if let last = appState.logs.last {
+                                withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                            }
+                        }
                     }
                 }
             }
             .navigationTitle("Logs")
             .toolbar {
-                Button(action: { appState.logs.removeAll() }) {
-                    Image(systemName: "trash")
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button(action: { appState.logs.removeAll() }) {
+                        Image(systemName: "trash")
+                    }
+                    .disabled(appState.logs.isEmpty)
                 }
             }
         }
+    }
+    
+    private func timeString(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter.string(from: date)
     }
     
     private func colorForLog(_ log: String) -> Color {
