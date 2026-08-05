@@ -43,38 +43,40 @@ struct OnboardingView: View {
                     title: "Enter Connection Details",
                     description: "Enter your tablet's IP address and auth token:",
                     isComplete: connectionSuccess
-                ) {
-                    VStack(spacing: 12) {
-                        TextField("Tablet IP Address (e.g., 192.168.1.70)", text: $ipInput)
-                            .textFieldStyle(.roundedBorder)
-                            .keyboardType(.decimalPad)
-                            .autocapitalization(.none)
-                        
-                        TextField("Auth Token", text: $tokenInput)
-                            .textFieldStyle(.roundedBorder)
-                            .autocapitalization(.none)
-                        
-                        Button(action: testConnection) {
-                            HStack {
-                                if testingConnection {
-                                    ProgressView()
-                                        .tint(.white)
-                                }
-                                Text(testingConnection ? "Testing..." : "Test Connection")
+                )
+                
+                // Connection form
+                VStack(spacing: 12) {
+                    TextField("Tablet IP Address (e.g., 192.168.1.70)", text: $ipInput)
+                        .textFieldStyle(.roundedBorder)
+                        .keyboardType(.decimalPad)
+                        .autocapitalization(.none)
+                    
+                    TextField("Auth Token", text: $tokenInput)
+                        .textFieldStyle(.roundedBorder)
+                        .autocapitalization(.none)
+                    
+                    Button(action: testConnection) {
+                        HStack {
+                            if testingConnection {
+                                ProgressView()
+                                    .tint(.white)
                             }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 8)
+                            Text(testingConnection ? "Testing..." : "Test Connection")
                         }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(ipInput.isEmpty || testingConnection)
-                        
-                        if let result = connectionTestResult {
-                            Text(result)
-                                .font(.caption)
-                                .foregroundColor(connectionSuccess ? .green : .red)
-                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(ipInput.isEmpty || testingConnection)
+                    
+                    if let result = connectionTestResult {
+                        Text(result)
+                            .font(.caption)
+                            .foregroundColor(connectionSuccess ? .green : .red)
                     }
                 }
+                .padding(.horizontal, 24)
                 
                 OnboardingStep(
                     number: 3,
@@ -142,22 +144,12 @@ struct OnboardingView: View {
     }
 }
 
-struct OnboardingStep<Content: View>: View {
+struct OnboardingStep: View {
     let number: Int
     let title: String
     let description: String
     var codeBlock: String? = nil
     let isComplete: Bool
-    var content: Content? = nil
-    
-    init(number: Int, title: String, description: String, codeBlock: String? = nil, isComplete: Bool, content: Content? = nil) where Content: View {
-        self.number = number
-        self.title = title
-        self.description = description
-        self.codeBlock = codeBlock
-        self.isComplete = isComplete
-        self.content = content
-    }
     
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -194,11 +186,6 @@ struct OnboardingStep<Content: View>: View {
                     .padding(10)
                     .background(Color(UIColor.tertiarySystemBackground))
                     .cornerRadius(8)
-                    .padding(.leading, 40)
-            }
-            
-            if let content = content {
-                content
                     .padding(.leading, 40)
             }
         }
