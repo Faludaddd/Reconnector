@@ -5,16 +5,24 @@ struct LogsView: View {
     
     var body: some View {
         NavigationView {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(appState.logs.indices, id: \.self) { index in
-                        Text(appState.logs[index])
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(colorForLog(appState.logs[index]))
-                            .frame(maxWidth: .infinity, alignment: .leading)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        ForEach(appState.logs) { entry in
+                            Text(entry.text)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundColor(colorForLog(entry.text))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .id(entry.id)
+                        }
+                    }
+                    .padding()
+                }
+                .onChange(of: appState.logs.count) { _ in
+                    if let last = appState.logs.last {
+                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                     }
                 }
-                .padding()
             }
             .navigationTitle("Logs")
             .toolbar {
@@ -26,9 +34,11 @@ struct LogsView: View {
     }
     
     private func colorForLog(_ log: String) -> Color {
-        if log.contains("[ERROR]") || log.contains("CRASH") { return .red }
-        if log.contains("[WARNING]") { return .yellow }
-        if log.contains("[SUCCESS]") { return .green }
+        let lower = log.lowercased()
+        if lower.contains("[error]") || lower.contains("crash") || lower.contains("failed") { return .red }
+        if lower.contains("[warning]") { return .yellow }
+        if lower.contains("[success]") || lower.contains("successful") { return .green }
+        if lower.contains("[startup]") { return .blue }
         return .primary
     }
 }

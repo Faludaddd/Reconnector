@@ -24,7 +24,12 @@ struct SettingsView: View {
                 
                 Section("Watchdog Interval") {
                     if let status = appState.status {
-                        Picker("Interval", selection: .constant(status.interval)) {
+                        Picker("Interval", selection: Binding(
+                            get: { status.interval },
+                            set: { newValue in
+                                Task { try? await APIClient(ipAddress: appState.ipAddress, authToken: appState.authToken).setInterval(minutes: newValue) }
+                            }
+                        )) {
                             Text("1 min").tag(1)
                             Text("5 min").tag(5)
                             Text("10 min").tag(10)
@@ -39,6 +44,12 @@ struct SettingsView: View {
                         Text("Version")
                         Spacer()
                         Text("1.0.0").foregroundColor(.secondary)
+                    }
+                    HStack {
+                        Text("Connection")
+                        Spacer()
+                        Text(appState.isConnected ? "Connected" : "Disconnected")
+                            .foregroundColor(appState.isConnected ? .green : .red)
                     }
                 }
             }

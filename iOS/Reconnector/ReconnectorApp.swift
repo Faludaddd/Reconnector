@@ -9,6 +9,7 @@ struct ReconnectorApp: App {
             ContentView()
                 .environmentObject(appState)
                 .preferredColorScheme(.dark)
+                .tint(.blue)
         }
     }
 }
