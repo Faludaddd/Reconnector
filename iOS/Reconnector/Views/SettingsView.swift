@@ -74,7 +74,7 @@ struct SettingsView: View {
                 
                 // MARK: - About
                 Section("About") {
-                    HStack { Text("Version"); Spacer(); Text("1.0.4").foregroundColor(.secondary) }
+                    HStack { Text("Version"); Spacer(); Text("1.0.5").foregroundColor(.secondary) }
                     HStack { Text("Backend"); Spacer(); Text(appState.status != nil ? "Online" : "Offline").foregroundColor(appState.status != nil ? .green : .red) }
                     Button(role: .destructive) { showingResetAlert = true } label: { Label("Reset All Settings", systemImage: "trash") }
                 }

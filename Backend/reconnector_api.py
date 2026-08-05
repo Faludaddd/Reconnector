@@ -179,8 +179,80 @@ def has_internet_sync():
     except: return False
 
 # ============================================================
-# RECONNECT LOGIC
+# ROBLOX LAUNCH LOGIC (Completely Rewritten)
 # ============================================================
+def launch_roblox_sync(launch_url, force_kill_first=True):
+    """Launch Roblox with intelligent handling.
+    Returns True if Roblox process is confirmed running after launch."""
+    
+    # Step 1: Kill existing process if requested
+    if force_kill_first:
+        logger.info("[LAUNCH] Force-stopping any existing Roblox process...")
+        _run_cmd_sync(f'am force-stop {PACKAGE}')
+        time.sleep(1.5)
+        
+        # Check if process is still alive
+        pid = get_roblox_pid_sync()
+        if pid:
+            logger.warning(f"[LAUNCH] Process still alive after force-stop, killing PID {pid.split()[0]}...")
+            _run_cmd_sync(f'kill -9 {pid.split()[0]}')
+            time.sleep(1)
+            
+            # Verify it's actually dead
+            pid2 = get_roblox_pid_sync()
+            if pid2:
+                logger.error(f"[LAUNCH] Could not kill Roblox process (PID {pid2})")
+                # Try harder
+                _run_cmd_sync(f'am force-stop {PACKAGE}')
+                time.sleep(2)
+        else:
+            logger.info("[LAUNCH] Roblox stopped cleanly")
+    else:
+        # Check if Roblox is already running
+        pid = get_roblox_pid_sync()
+        if pid and is_process_alive_sync(pid):
+            logger.info(f"[LAUNCH] Roblox already running (PID {pid.split()[0]})")
+            # Still send the launch intent to bring it to foreground
+            _run_cmd_sync(f'am start -a android.intent.action.VIEW -d "{launch_url}"')
+            return True
+    
+    # Step 2: Launch Roblox
+    logger.info(f"[LAUNCH] Sending launch intent: {launch_url}")
+    result = _run_cmd_sync(f'am start -a android.intent.action.VIEW -d "{launch_url}"', timeout=10)
+    
+    if "Error" in result or "error" in result.lower():
+        logger.error(f"[LAUNCH] Launch command returned error: {result}")
+    
+    # Step 3: Wait for Roblox process to appear
+    logger.info("[LAUNCH] Waiting for Roblox process to start...")
+    poll_deadline = time.time() + 25
+    time.sleep(3)  # Initial wait for process spawn
+    
+    while time.time() < poll_deadline:
+        pid = get_roblox_pid_sync()
+        if pid:
+            alive = is_process_alive_sync(pid)
+            if alive:
+                logger.info(f"[LAUNCH] Roblox started successfully (PID {pid.split()[0]})")
+                return True
+            else:
+                logger.warning(f"[LAUNCH] PID {pid} exists but process is zombie, waiting...")
+        time.sleep(1.5)
+    
+    # Step 4: If first launch method failed, try alternative
+    logger.warning("[LAUNCH] Primary launch failed, trying component launch...")
+    _run_cmd_sync(f'am start -n {PACKAGE}/.startup.ActivitySplash')
+    time.sleep(5)
+    
+    pid = get_roblox_pid_sync()
+    if pid and is_process_alive_sync(pid):
+        logger.info(f"[LAUNCH] Roblox started via component launch (PID {pid.split()[0]})")
+        return True
+    
+    logger.error("[LAUNCH] All launch methods failed")
+    return False
+
+
 def reconnect_game_sync(reason="unknown", clear_cache=False):
     with reconnect_lock:
         recent = [t for t in state.reconnect_timestamps if time.time() - t < 60]
@@ -202,7 +274,7 @@ def reconnect_game_sync(reason="unknown", clear_cache=False):
         launch_url = f"roblox://placeId={m.group(1)}" if m else state.current_game_link
 
         max_attempts = 3
-        backoff_delays = [0, 10, 20]
+        backoff_delays = [0, 8, 15]
         relaunched = False
 
         for attempt in range(max_attempts):
@@ -213,40 +285,28 @@ def reconnect_game_sync(reason="unknown", clear_cache=False):
             else:
                 logger.info(f"[RECONNECTOR] Attempt 1/{max_attempts}...")
 
-            logger.info("[RECONNECTOR] Step 1: Force-stopping Roblox...")
-            _run_cmd_sync(f'am force-stop {PACKAGE}')
-            time.sleep(1)
-
-            pid_check = get_roblox_pid_sync()
-            if pid_check:
-                logger.info(f"[RECONNECTOR] Step 2: Killing PID {pid_check.split()[0]}...")
-                _run_cmd_sync(f'kill -9 {pid_check.split()[0]}')
-                time.sleep(0.5)
-            else:
-                logger.info("[RECONNECTOR] Step 2: Roblox stopped cleanly")
-
-            logger.info(f"[RECONNECTOR] Step 3: Launching Roblox ({launch_url})...")
-            _run_cmd_sync(f'am start -a android.intent.action.VIEW -d "{launch_url}"')
-
-            logger.info("[RECONNECTOR] Step 4: Waiting for Roblox to start...")
-            poll_deadline = time.time() + 30
-            time.sleep(3)
-            while time.time() < poll_deadline:
-                pid = get_roblox_pid_sync()
-                if pid and is_process_alive_sync(pid):
-                    relaunched = True
-                    break
-                time.sleep(1.5)
+            # Use the new intelligent launch function
+            relaunched = launch_roblox_sync(launch_url, force_kill_first=True)
 
             if relaunched:
                 logger.info(f"[RECONNECTOR] Recovery successful on attempt {attempt + 1}!")
                 break
             else:
-                logger.warning(f"[RECONNECTOR] Attempt {attempt + 1} failed")
+                logger.warning(f"[RECONNECTOR] Attempt {attempt + 1} failed - Roblox did not start")
+                # On final attempt, try without killing
+                if attempt == max_attempts - 1:
+                    logger.info("[RECONNECTOR] Final attempt: trying without force-kill...")
+                    relaunched = launch_roblox_sync(launch_url, force_kill_first=False)
+                    if relaunched:
+                        logger.info("[RECONNECTOR] Recovery successful on final attempt!")
+                        break
 
         state.consecutive_ocr_hits = 0
         state.last_reconnect_time = time.time()
         state.roblox_state = "loading" if relaunched else "offline"
+        
+        if not relaunched:
+            logger.error("[RECONNECTOR] ALL RECOVERY ATTEMPTS FAILED - Roblox would not launch")
 
 # ============================================================
 # FAST DISCONNECT CHECKER (Background Thread)
