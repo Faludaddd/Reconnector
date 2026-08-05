@@ -68,6 +68,12 @@ class APIClient {
         let (_, _) = try await URLSession.shared.data(for: request)
     }
     
+    func getCrashes() async throws -> CrashResponse {
+        let request = makeRequest(path: "/api/crashes")
+        let (data, _) = try await URLSession.shared.data(for: request)
+        return try JSONDecoder().decode(CrashResponse.self, from: data)
+    }
+    
     func toggleOptimization(name: String, enabled: Bool) async throws {
         var request = makeRequest(path: "/api/optimize/\(name)", method: "POST")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["enabled": enabled])
