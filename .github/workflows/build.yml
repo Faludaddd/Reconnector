@@ -1,0 +1,47 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install xcodegen
+      run: brew install xcodegen
+    
+    - name: Generate Xcode Project
+      run: |
+        cd iOS
+        xcodegen generate
+    
+    - name: Build App
+      run: |
+        cd iOS
+        xcodebuild -project Reconnector.xcodeproj \
+          -scheme Reconnector \
+          -configuration Release \
+          -sdk iphoneos \
+          -derivedDataPath build \
+          CODE_SIGN_IDENTITY="" \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGNING_ALLOWED=NO \
+          -archivePath build/Reconnector.xcarchive \
+          archive
+    
+    - name: Create IPA
+      run: |
+        cd iOS/build
+        mkdir Payload
+        cp -r Reconnector.xcarchive/Products/Applications/Reconnector.app Payload/
+        zip -r Reconnector.ipa Payload
+    
+    - uses: actions/upload-artifact@v4
+      with:
+        name: Reconnector-IPA
+        path: iOS/build/Reconnector.ipa
