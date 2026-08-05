@@ -84,7 +84,7 @@ struct DashboardView: View {
                     }
                     
                     // Version footer
-                    Text("Reconnector v1.0.2")
+                    Text("Reconnector v1.0.3")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                         .padding(.top, 8)

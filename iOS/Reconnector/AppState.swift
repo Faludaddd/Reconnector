@@ -13,13 +13,13 @@ class AppState: ObservableObject {
     @Published var screenshotImage: UIImage?
     @Published var crashes: [CrashEntry] = []
     
-    private var webSocketTask: URLSessionWebSocketTask?
-    private var reconnectTimer: Timer?
-    private var isConnecting = false
+    private var pollTimer: Timer?
+    private var logPollTimer: Timer?
+    private var isPolling = false
     
     init() {
         if !ipAddress.isEmpty {
-            connectWebSocket()
+            startPolling()
         }
     }
     
@@ -29,123 +29,92 @@ class AppState: ObservableObject {
         defaults.set(authToken, forKey: "authToken")
         defaults.synchronize()
         
-        // Cancel existing connection and reconnect with new settings
-        webSocketTask?.cancel()
-        webSocketTask = nil
-        
-        // Use a delay to let UserDefaults flush
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            self?.connectWebSocket()
+            self?.startPolling()
         }
     }
     
-    func connectWebSocket() {
-        // Prevent multiple simultaneous connection attempts
-        guard !isConnecting else { return }
-        
-        // Cancel existing connection
-        webSocketTask?.cancel()
-        webSocketTask = nil
+    func startPolling() {
+        stopPolling()
         
         guard !ipAddress.isEmpty else {
             connectionError = "No IP address set. Go to Settings to configure."
             return
         }
         
-        isConnecting = true
         connectionError = nil
+        fetchStatusNow()
         
-        let urlString = "ws://\(ipAddress):8080/ws"
-        guard let url = URL(string: urlString) else {
-            connectionError = "Invalid IP address"
-            isConnecting = false
-            return
+        // Poll status every 5 seconds
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.fetchStatusNow()
         }
         
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 10
-        
-        webSocketTask = URLSession.shared.webSocketTask(with: request)
-        webSocketTask?.resume()
-        
-        // Check connection status after 3 seconds
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            guard let self = self else { return }
-            if !self.isConnected {
-                self.isConnecting = false
-                self.connectionError = "Failed to connect. Check IP address and that backend is running."
-                self.scheduleReconnect()
-            }
-        }
-        
-        receiveWebSocket()
-    }
-    
-    private func receiveWebSocket() {
-        webSocketTask?.receive { [weak self] result in
-            guard let self = self else { return }
-            switch result {
-            case .success(let message):
-                self.isConnecting = false
-                
-                switch message {
-                case .data(let data):
-                    self.handleWebSocketData(data)
-                case .string(let text):
-                    if let data = text.data(using: .utf8) {
-                        self.handleWebSocketData(data)
-                    }
-                @unknown default:
-                    break
-                }
-                
-                // Connection is alive, keep receiving
-                self.receiveWebSocket()
-                
-            case .failure(let error):
-                DispatchQueue.main.async {
-                    self.isConnected = false
-                    self.isConnecting = false
-                    self.connectionError = "Connection lost: \(error.localizedDescription)"
-                }
-                self.scheduleReconnect()
-            }
+        // Poll logs every 3 seconds
+        logPollTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            self?.fetchLogsNow()
         }
     }
     
-    private func handleWebSocketData(_ data: Data) {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-        let type = json["type"] as? String ?? ""
+    func stopPolling() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+        logPollTimer?.invalidate()
+        logPollTimer = nil
+    }
+    
+    func connectWebSocket() {
+        startPolling()
+    }
+    
+    private func fetchStatusNow() {
+        guard !ipAddress.isEmpty, !isPolling else { return }
+        isPolling = true
         
-        if type == "status", let statusData = json["data"] as? [String: Any] {
-            if let jsonData = try? JSONSerialization.data(withJSONObject: statusData) {
-                let decoded = try? JSONDecoder().decode(BotStatus.self, from: jsonData)
-                DispatchQueue.main.async {
-                    self.status = decoded
+        let client = APIClient(ipAddress: ipAddress, authToken: authToken)
+        Task {
+            do {
+                let s = try await client.getStatus()
+                await MainActor.run {
+                    self.status = s
                     self.lastConnectionTime = Date()
                     self.isConnected = true
                     self.connectionError = nil
+                    self.isPolling = false
                 }
-            }
-        } else if type == "log", let logMsg = json["data"] as? String {
-            let entry = LogEntry(text: logMsg, timestamp: Date())
-            DispatchQueue.main.async {
-                self.logs.append(entry)
-                if self.logs.count > 500 {
-                    self.logs.removeFirst(self.logs.count - 500)
+            } catch {
+                await MainActor.run {
+                    self.isConnected = false
+                    self.isPolling = false
+                    self.connectionError = "Cannot reach backend: \(error.localizedDescription)"
                 }
             }
         }
     }
     
-    private func scheduleReconnect() {
-        // Cancel any existing reconnect timer
-        reconnectTimer?.invalidate()
+    private func fetchLogsNow() {
+        guard !ipAddress.isEmpty else { return }
         
-        // Schedule reconnect after 10 seconds (not 5, to avoid spam)
-        reconnectTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: false) { [weak self] _ in
-            self?.connectWebSocket()
-        }
+        let url = URL(string: "http://\(ipAddress):8080/api/logs")!
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 5
+        
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let logLines = json["logs"] as? [String] else { return }
+            
+            DispatchQueue.main.async {
+                // Only add new logs
+                let newEntries = logLines.enumerated().compactMap { index, text -> LogEntry? in
+                    let entry = LogEntry(text: text, timestamp: Date())
+                    return entry
+                }
+                
+                // Replace logs entirely (server sends last 100)
+                self.logs = newEntries
+            }
+        }.resume()
     }
     
     func fetchStatus() async {
@@ -161,7 +130,7 @@ class AppState: ObservableObject {
             }
         } catch {
             DispatchQueue.main.async {
-                self.connectionError = "Failed to fetch status: \(error.localizedDescription)"
+                self.connectionError = "Failed: \(error.localizedDescription)"
             }
         }
     }
