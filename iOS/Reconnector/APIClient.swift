@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 class APIClient {
     let ipAddress: String
@@ -22,6 +23,12 @@ class APIClient {
         let request = makeRequest(path: "/api/status")
         let (data, _) = try await URLSession.shared.data(for: request)
         return try JSONDecoder().decode(BotStatus.self, from: data)
+    }
+    
+    func getScreenshot() async throws -> ScreenshotResponse {
+        let request = makeRequest(path: "/api/screenshot")
+        let (data, _) = try await URLSession.shared.data(for: request)
+        return try JSONDecoder().decode(ScreenshotResponse.self, from: data)
     }
     
     func restart() async throws {
@@ -62,7 +69,8 @@ class APIClient {
     }
     
     func toggleOptimization(name: String, enabled: Bool) async throws {
-        var request = makeRequest(path: "/api/optimize/\(name)?enabled=\(enabled)", method: "POST")
+        var request = makeRequest(path: "/api/optimize/\(name)", method: "POST")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["enabled": enabled])
         let (_, _) = try await URLSession.shared.data(for: request)
     }
 }

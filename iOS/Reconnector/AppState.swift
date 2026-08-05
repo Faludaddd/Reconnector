@@ -66,11 +66,11 @@ class AppState: ObservableObject {
             if type == "status", let statusData = json["data"] as? [String: Any] {
                 if let jsonData = try? JSONSerialization.data(withJSONObject: statusData) {
                     let decoded = try? JSONDecoder().decode(BotStatus.self, from: jsonData)
-                    DispatchQueue.main.async { self?.status = decoded }
+                    DispatchQueue.main.async { self.status = decoded }
                 }
             } else if type == "log", let logMsg = json["data"] as? String {
                 let entry = LogEntry(text: logMsg, timestamp: Date())
-                DispatchQueue.main.async { self?.logs.append(entry) }
+                DispatchQueue.main.async { self.logs.append(entry) }
             }
         }
     }
