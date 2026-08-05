@@ -1,6 +1,6 @@
 """
-Reconnector API Server
-======================
+Reconnector API Server v2
+=========================
 FastAPI backend that replaces discord.py. Runs on Termux.
 Exposes HTTP endpoints and a WebSocket for the iOS app to control the bot.
 """
@@ -14,11 +14,10 @@ import logging
 import signal
 import sys
 import io
-import threading
+import base64
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Security, Depends, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
@@ -62,7 +61,11 @@ class WebSocketLogHandler(logging.Handler):
         self.manager = manager
     def emit(self, record):
         msg = self.format(record)
-        self.manager.broadcast_sync({"type": "log", "data": msg, "timestamp": time.time()})
+        try:
+            if self.manager._loop and self.manager._loop.is_running():
+                asyncio.run_coroutine_threadsafe(self.manager.broadcast({"type": "log", "data": msg, "timestamp": time.time()}), self.manager._loop)
+        except:
+            pass
 
 _sh = logging.StreamHandler(sys.stdout)
 _sh.setFormatter(_fmt)
@@ -81,17 +84,20 @@ except Exception as e:
 class State:
     current_game_link = "https://www.roblox.com/games/84515722934860/Anime-Expeditions"
     is_paused = False
+    is_dark_mode = False
     watchdog_enabled = True
     watchdog_interval_minutes = 1
     brightness_level = 100
     last_crash_reason = "-"
     last_crash_at = None
     session_start = time.time()
+    bot_first_start_time = time.time()
     roblox_state = "unknown"
     last_reconnect_time = 0
     consecutive_ocr_hits = 0
-    stats = {"crashes": 0, "kicks": 0}
+    stats = {"crashes": 0, "kicks": 0, "network_drops": 0}
     reconnect_timestamps = []
+    crash_log = []
     opt_kill_bg = False
     opt_process_limit = False
     opt_no_animations = False
@@ -99,7 +105,6 @@ class State:
     opt_no_bluetooth = False
 
 state = State()
-state_lock = asyncio.Lock()
 reconnect_lock = asyncio.Lock()
 
 # ============================================================
@@ -192,6 +197,13 @@ def _get_system_info_sync():
 async def get_system_info():
     return await asyncio.to_thread(_get_system_info_sync)
 
+async def has_internet():
+    try:
+        result = await run_cmd('ping -c 1 -W 3 8.8.8.8', timeout=6)
+        return "1 received" in result or "1 packets received" in result
+    except:
+        return False
+
 # ============================================================
 # RECONNECT LOGIC
 # ============================================================
@@ -199,7 +211,7 @@ async def reconnect_game(reason="unknown", clear_cache=False):
     async with reconnect_lock:
         recent = [t for t in state.reconnect_timestamps if time.time() - t < 60]
         if recent:
-            logger.info(f"[SKIP] Reconnect already in progress")
+            logger.info("[SKIP] Reconnect already in progress")
             return
 
         state.stats["crashes"] += 1
@@ -207,6 +219,8 @@ async def reconnect_game(reason="unknown", clear_cache=False):
         state.last_crash_reason = reason
         state.last_crash_at = datetime.now()
         state.roblox_state = "reconnecting"
+        state.crash_log.insert(0, {"timestamp": int(time.time()), "reason": reason})
+        if len(state.crash_log) > 50: state.crash_log = state.crash_log[:50]
         
         logger.info(f"[RECONNECTOR] Trigger received: {reason}")
 
@@ -294,24 +308,24 @@ async def fast_disconnect_checker():
             state.consecutive_ocr_hits = 0
 
 # ============================================================
-# WEBSOCKET MANAGER
+# WEBSOCKET MANAGER (Fixed: no auth required for local network)
 # ============================================================
 class WebSocketManager:
     def __init__(self):
         self.active_connections = []
-        self._loop = asyncio.get_event_loop()
+        self._loop = None
     async def connect(self, ws: WebSocket):
         await ws.accept()
         self.active_connections.append(ws)
+        self._loop = asyncio.get_event_loop()
+        logger.info(f"[WS] Client connected. Total: {len(self.active_connections)}")
     def disconnect(self, ws: WebSocket):
         if ws in self.active_connections: self.active_connections.remove(ws)
+        logger.info(f"[WS] Client disconnected. Total: {len(self.active_connections)}")
     async def broadcast(self, msg: dict):
         for c in self.active_connections[:]:
             try: await c.send_json(msg)
             except: self.disconnect(c)
-    def broadcast_sync(self, msg: dict):
-        if self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self.broadcast(msg), self._loop)
 
 ws_manager = WebSocketManager()
 logger.addHandler(WebSocketLogHandler(ws_manager))
@@ -320,15 +334,11 @@ logger.addHandler(WebSocketLogHandler(ws_manager))
 # FASTAPI APP
 # ============================================================
 app = FastAPI(title="Reconnector API")
-security = HTTPBearer()
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
-    if credentials.credentials != AUTH_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid token")
 
 @app.get("/api/status")
 async def get_status():
-    battery, sys_info, pid = await asyncio.gather(get_battery(), get_system_info(), get_roblox_pid())
+    battery, sys_info, pid, online = await asyncio.gather(get_battery(), get_system_info(), get_roblox_pid(), has_internet())
+    elapsed = int(time.time() - state.bot_first_start_time)
     return {
         "roblox_state": state.roblox_state,
         "roblox_running": bool(pid),
@@ -337,8 +347,10 @@ async def get_status():
         "ram_total": sys_info.get("ram_total"),
         "ram_free": sys_info.get("ram_free"),
         "uptime": sys_info.get("uptime"),
+        "internet": online,
         "crashes_today": state.stats["crashes"],
         "kicks_today": state.stats["kicks"],
+        "network_drops": state.stats["network_drops"],
         "watchdog_enabled": state.watchdog_enabled,
         "is_paused": state.is_paused,
         "interval": state.watchdog_interval_minutes,
@@ -346,6 +358,7 @@ async def get_status():
         "brightness": state.brightness_level,
         "last_crash_reason": state.last_crash_reason,
         "last_reconnect": int(state.last_reconnect_time) if state.last_reconnect_time else 0,
+        "bot_uptime": elapsed,
         "optimizations": {
             "kill_bg": state.opt_kill_bg,
             "process_limit": state.opt_process_limit,
@@ -354,6 +367,10 @@ async def get_status():
             "no_bluetooth": state.opt_no_bluetooth,
         }
     }
+
+@app.get("/api/crashes")
+async def get_crashes():
+    return {"crashes": state.crash_log[:20]}
 
 @app.post("/api/restart")
 async def restart_roblox():
@@ -365,13 +382,12 @@ async def screenshot():
     img_path = "/sdcard/rbx_manual.png"
     await run_cmd(f'screencap -p {img_path}')
     try:
-        import base64
         with open(img_path, 'rb') as f:
             img_data = base64.b64encode(f.read()).decode('utf-8')
         await run_cmd(f'rm -f {img_path}')
         return {"image": img_data}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "image": ""}
 
 @app.post("/api/black-screen")
 async def black_screen():
@@ -428,17 +444,24 @@ async def get_logs():
         return {"logs": lines}
     except: return {"logs": []}
 
+# WebSocket - NO AUTH REQUIRED (local network only)
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws_manager.connect(ws)
     try:
+        # Send initial status immediately
+        status = await get_status()
+        await ws.send_json({"type": "status", "data": status, "timestamp": time.time()})
+        
+        # Keep connection alive with periodic status updates
         while True:
             await asyncio.sleep(5)
             status = await get_status()
             await ws.send_json({"type": "status", "data": status, "timestamp": time.time()})
     except WebSocketDisconnect:
         ws_manager.disconnect(ws)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[WS] Error: {e}")
         ws_manager.disconnect(ws)
 
 # ============================================================
@@ -446,8 +469,9 @@ async def websocket_endpoint(ws: WebSocket):
 # ============================================================
 @app.on_event("startup")
 async def startup_event():
-    logger.info("[STARTUP] Reconnector API starting...")
+    logger.info("[STARTUP] Reconnector API v2 starting...")
     logger.info(f"[STARTUP] Auth token: {AUTH_TOKEN[:4]}...")
+    logger.info("[STARTUP] WebSocket: NO AUTH REQUIRED (local network)")
     asyncio.create_task(fast_disconnect_checker())
 
 if __name__ == "__main__":

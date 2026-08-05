@@ -1,4 +1,4 @@
-import SwiftUI
+import Foundation
 import Combine
 import UIKit
 
@@ -11,10 +11,11 @@ class AppState: ObservableObject {
     @Published var lastConnectionTime: Date?
     @Published var connectionError: String?
     @Published var screenshotImage: UIImage?
-    @Published var hasCompletedSetup: Bool = UserDefaults.standard.bool(forKey: "hasCompletedSetup")
+    @Published var crashes: [CrashEntry] = []
     
     private var webSocketTask: URLSessionWebSocketTask?
-    private var reconnectAttempts = 0
+    private var reconnectTimer: Timer?
+    private var isConnecting = false
     
     init() {
         if !ipAddress.isEmpty {
@@ -28,19 +29,20 @@ class AppState: ObservableObject {
         defaults.set(authToken, forKey: "authToken")
         defaults.synchronize()
         
-        // Small delay to let UserDefaults flush
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+        // Cancel existing connection and reconnect with new settings
+        webSocketTask?.cancel()
+        webSocketTask = nil
+        
+        // Use a delay to let UserDefaults flush
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
             self?.connectWebSocket()
         }
     }
     
-    func completeSetup() {
-        hasCompletedSetup = true
-        UserDefaults.standard.set(true, forKey: "hasCompletedSetup")
-        UserDefaults.standard.synchronize()
-    }
-    
     func connectWebSocket() {
+        // Prevent multiple simultaneous connection attempts
+        guard !isConnecting else { return }
+        
         // Cancel existing connection
         webSocketTask?.cancel()
         webSocketTask = nil
@@ -50,27 +52,33 @@ class AppState: ObservableObject {
             return
         }
         
+        isConnecting = true
         connectionError = nil
         
         let urlString = "ws://\(ipAddress):8080/ws"
         guard let url = URL(string: urlString) else {
             connectionError = "Invalid IP address"
+            isConnecting = false
             return
         }
         
         var request = URLRequest(url: url)
         request.timeoutInterval = 10
-        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
         
         webSocketTask = URLSession.shared.webSocketTask(with: request)
         webSocketTask?.resume()
         
-        isConnected = true
-        reconnectAttempts = 0
-        receiveWebSocket()
+        // Check connection status after 3 seconds
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self = self else { return }
+            if !self.isConnected {
+                self.isConnecting = false
+                self.connectionError = "Failed to connect. Check IP address and that backend is running."
+                self.scheduleReconnect()
+            }
+        }
         
-        // Also fetch status immediately
-        Task { await fetchStatus() }
+        receiveWebSocket()
     }
     
     private func receiveWebSocket() {
@@ -78,6 +86,8 @@ class AppState: ObservableObject {
             guard let self = self else { return }
             switch result {
             case .success(let message):
+                self.isConnecting = false
+                
                 switch message {
                 case .data(let data):
                     self.handleWebSocketData(data)
@@ -88,14 +98,17 @@ class AppState: ObservableObject {
                 @unknown default:
                     break
                 }
+                
+                // Connection is alive, keep receiving
                 self.receiveWebSocket()
                 
             case .failure(let error):
                 DispatchQueue.main.async {
                     self.isConnected = false
+                    self.isConnecting = false
                     self.connectionError = "Connection lost: \(error.localizedDescription)"
                 }
-                self.attemptReconnect()
+                self.scheduleReconnect()
             }
         }
     }
@@ -118,7 +131,6 @@ class AppState: ObservableObject {
             let entry = LogEntry(text: logMsg, timestamp: Date())
             DispatchQueue.main.async {
                 self.logs.append(entry)
-                // Keep last 500 logs
                 if self.logs.count > 500 {
                     self.logs.removeFirst(self.logs.count - 500)
                 }
@@ -126,11 +138,12 @@ class AppState: ObservableObject {
         }
     }
     
-    private func attemptReconnect() {
-        reconnectAttempts += 1
-        let delay = min(5 * reconnectAttempts, 30)
+    private func scheduleReconnect() {
+        // Cancel any existing reconnect timer
+        reconnectTimer?.invalidate()
         
-        DispatchQueue.main.asyncAfter(deadline: .now() + TimeInterval(delay)) { [weak self] in
+        // Schedule reconnect after 10 seconds (not 5, to avoid spam)
+        reconnectTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: false) { [weak self] _ in
             self?.connectWebSocket()
         }
     }
@@ -166,18 +179,14 @@ class AppState: ObservableObject {
         }
     }
     
-    func getConnectionStatusText() -> String {
-        if !isConnected {
-            if let error = connectionError {
-                return "Disconnected: \(error)"
-            }
-            return "Disconnected"
+    func fetchCrashes() async {
+        guard !ipAddress.isEmpty else { return }
+        let client = APIClient(ipAddress: ipAddress, authToken: authToken)
+        do {
+            let response = try await client.getCrashes()
+            DispatchQueue.main.async { self.crashes = response.crashes }
+        } catch {
+            print("Failed to fetch crashes: \(error)")
         }
-        if let lastTime = lastConnectionTime {
-            let formatter = RelativeDateTimeFormatter()
-            formatter.unitsStyle = .short
-            return "Connected · Last update \(formatter.localizedString(for: lastTime, relativeTo: Date()))"
-        }
-        return "Connected"
     }
 }
