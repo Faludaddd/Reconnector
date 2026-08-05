@@ -2,9 +2,9 @@ import Foundation
 import Combine
 import UIKit
 import SwiftUI
+import UserNotifications
 
 class AppState: ObservableObject {
-    // Connection
     @Published var ipAddress: String = UserDefaults.standard.string(forKey: "ipAddress") ?? ""
     @Published var authToken: String = UserDefaults.standard.string(forKey: "authToken") ?? "reconnector123"
     @Published var status: BotStatus?
@@ -14,70 +14,73 @@ class AppState: ObservableObject {
     @Published var connectionError: String?
     @Published var screenshotImage: UIImage?
     @Published var crashes: [CrashEntry] = []
+    @Published var isPerformingAction: Bool = false
+    @Published var actionProgress: Double = 0
+    @Published var actionName: String = ""
+    @Published var actionTimeRemaining: Int = 0
     
-    // Appearance Settings
-    @Published var colorScheme: ColorScheme? = UserDefaults.standard.object(forKey: "colorScheme") as? String == "light" ? .light : .dark
-    @Published var accentColor: Color = UserDefaults.standard.colorForKey("accentColor") ?? .blue
-    @Published var compactMode: Bool = UserDefaults.standard.bool(forKey: "compactMode")
-    
-    // Notification Settings
-    @Published var notifyOnDisconnect: Bool = UserDefaults.standard.bool(forKey: "notifyDisconnect")
-    @Published var notifyOnReconnect: Bool = UserDefaults.standard.bool(forKey: "notifyReconnect")
-    @Published var notifyOnError: Bool = UserDefaults.standard.bool(forKey: "notifyError")
-    
-    // Log Settings
-    @Published var logLevel: String = UserDefaults.standard.string(forKey: "logLevel") ?? "INFO"
-    @Published var autoScrollLogs: Bool = UserDefaults.standard.bool(forKey: "autoScrollLogs")
-    
-    // Connection Settings
-    @Published var autoConnect: Bool = UserDefaults.standard.bool(forKey: "autoConnect")
-    @Published var connectionTimeout: Int = UserDefaults.standard.integer(forKey: "timeout") == 0 ? 5 : UserDefaults.standard.integer(forKey: "timeout")
+    @Published var colorScheme: ColorScheme? = .dark
+    @Published var accentColor: Color = .blue
+    @Published var compactMode: Bool = false
+    @Published var notifyOnDisconnect: Bool = true
+    @Published var notifyOnReconnect: Bool = true
+    @Published var notifyOnError: Bool = true
+    @Published var logLevel: String = "INFO"
+    @Published var autoScrollLogs: Bool = true
+    @Published var autoConnect: Bool = true
     
     private var pollTimer: Timer?
     private var logPollTimer: Timer?
     private var isPolling = false
+    private var actionTimer: Timer?
     
     init() {
-        if !ipAddress.isEmpty && autoConnect {
-            startPolling()
-        }
+        loadSettings()
+        if !ipAddress.isEmpty && autoConnect { startPolling() }
+    }
+    
+    func loadSettings() {
+        let d = UserDefaults.standard
+        ipAddress = d.string(forKey: "ipAddress") ?? ""
+        authToken = d.string(forKey: "authToken") ?? "reconnector123"
+        colorScheme = d.string(forKey: "colorScheme") == "light" ? .light : .dark
+        accentColor = d.colorForKey("accentColor") ?? .blue
+        compactMode = d.bool(forKey: "compactMode")
+        notifyOnDisconnect = d.object(forKey: "notifyDisconnect") as? Bool ?? true
+        notifyOnReconnect = d.object(forKey: "notifyReconnect") as? Bool ?? true
+        notifyOnError = d.object(forKey: "notifyError") as? Bool ?? true
+        logLevel = d.string(forKey: "logLevel") ?? "INFO"
+        autoScrollLogs = d.object(forKey: "autoScrollLogs") as? Bool ?? true
+        autoConnect = d.object(forKey: "autoConnect") as? Bool ?? true
     }
     
     func saveSettings() {
-        let defaults = UserDefaults.standard
-        defaults.set(ipAddress, forKey: "ipAddress")
-        defaults.set(authToken, forKey: "authToken")
-        defaults.set(colorScheme == .light ? "light" : "dark", forKey: "colorScheme")
-        defaults.setColor(accentColor, forKey: "accentColor")
-        defaults.set(compactMode, forKey: "compactMode")
-        defaults.set(notifyOnDisconnect, forKey: "notifyDisconnect")
-        defaults.set(notifyOnReconnect, forKey: "notifyReconnect")
-        defaults.set(notifyOnError, forKey: "notifyError")
-        defaults.set(logLevel, forKey: "logLevel")
-        defaults.set(autoScrollLogs, forKey: "autoScrollLogs")
-        defaults.set(autoConnect, forKey: "autoConnect")
-        defaults.set(connectionTimeout, forKey: "timeout")
-        defaults.synchronize()
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            self?.startPolling()
-        }
+        let d = UserDefaults.standard
+        d.set(ipAddress, forKey: "ipAddress")
+        d.set(authToken, forKey: "authToken")
+        d.set(colorScheme == .light ? "light" : "dark", forKey: "colorScheme")
+        d.setColor(accentColor, forKey: "accentColor")
+        d.set(compactMode, forKey: "compactMode")
+        d.set(notifyOnDisconnect, forKey: "notifyDisconnect")
+        d.set(notifyOnReconnect, forKey: "notifyReconnect")
+        d.set(notifyOnError, forKey: "notifyError")
+        d.set(logLevel, forKey: "logLevel")
+        d.set(autoScrollLogs, forKey: "autoScrollLogs")
+        d.set(autoConnect, forKey: "autoConnect")
+        d.synchronize()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in self?.startPolling() }
     }
     
     func resetSettings() {
-        let defaults = UserDefaults.standard
-        for key in defaults.dictionaryRepresentation().keys {
-            defaults.removeObject(forKey: key)
-        }
-        defaults.synchronize()
+        let d = UserDefaults.standard
+        for key in d.dictionaryRepresentation().keys { d.removeObject(forKey: key) }
+        d.synchronize()
+        loadSettings()
     }
     
     func startPolling() {
         stopPolling()
-        guard !ipAddress.isEmpty else {
-            connectionError = "No IP address set. Go to Settings to configure."
-            return
-        }
+        guard !ipAddress.isEmpty else { connectionError = "No IP address set."; return }
         connectionError = nil
         fetchStatusNow()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in self?.fetchStatusNow() }
@@ -87,6 +90,48 @@ class AppState: ObservableObject {
     func stopPolling() { pollTimer?.invalidate(); pollTimer = nil; logPollTimer?.invalidate(); logPollTimer = nil }
     func connectWebSocket() { startPolling() }
     
+    // ACTION LOADING SYSTEM
+    func startAction(name: String, estimatedSeconds: Int) {
+        isPerformingAction = true
+        actionName = name
+        actionTimeRemaining = estimatedSeconds
+        actionProgress = 0
+        
+        actionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            self.actionTimeRemaining -= 1
+            self.actionProgress = Double(estimatedSeconds - self.actionTimeRemaining) / Double(estimatedSeconds)
+            if self.actionTimeRemaining <= 0 { self.endAction() }
+        }
+    }
+    
+    func endAction() {
+        actionTimer?.invalidate()
+        actionTimer = nil
+        isPerformingAction = false
+        actionProgress = 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.actionProgress = 0 }
+    }
+    
+    // NOTIFICATIONS
+    func requestNotificationPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+    }
+    
+    func sendNotification(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+    
+    func sendTestNotification() {
+        sendNotification(title: "Test Notification", body: "If you can see this, notifications are working!")
+    }
+    
+    // API CALLS
     private func fetchStatusNow() {
         guard !ipAddress.isEmpty, !isPolling else { return }
         isPolling = true
@@ -94,9 +139,28 @@ class AppState: ObservableObject {
         Task {
             do {
                 let s = try await client.getStatus()
-                await MainActor.run { self.status = s; self.lastConnectionTime = Date(); self.isConnected = true; self.connectionError = nil; self.isPolling = false }
+                let wasConnected = self.isConnected
+                await MainActor.run {
+                    self.status = s
+                    self.lastConnectionTime = Date()
+                    self.isConnected = true
+                    self.connectionError = nil
+                    self.isPolling = false
+                    // Notifications on state change
+                    if !wasConnected && self.notifyOnReconnect {
+                        self.sendNotification(title: "Reconnected", body: "Backend connection restored.")
+                    }
+                }
             } catch {
-                await MainActor.run { self.isConnected = false; self.isPolling = false; self.connectionError = "Cannot reach backend: \(error.localizedDescription)" }
+                let wasConnected = self.isConnected
+                await MainActor.run {
+                    self.isConnected = false
+                    self.isPolling = false
+                    self.connectionError = "Cannot reach backend"
+                    if wasConnected && self.notifyOnDisconnect {
+                        self.sendNotification(title: "Disconnected", body: "Lost connection to backend.")
+                    }
+                }
             }
         }
     }
@@ -111,16 +175,33 @@ class AppState: ObservableObject {
         }.resume()
     }
     
-    func fetchStatus() async { await fetchStatusNow() } // Wrapper for .task
+    func fetchStatus() async { await fetchStatusNow() }
+    
     func fetchScreenshot() async {
         guard !ipAddress.isEmpty else { return }
+        startAction(name: "Capturing Screenshot", estimatedSeconds: 5)
         let client = APIClient(ipAddress: ipAddress, authToken: authToken)
-        do { let response = try await client.getScreenshot(); if let imageData = Data(base64Encoded: response.image), let image = UIImage(data: imageData) { DispatchQueue.main.async { self.screenshotImage = image } } } catch {}
+        do {
+            let response = try await client.getScreenshot()
+            if let imageData = Data(base64Encoded: response.image), let image = UIImage(data: imageData) {
+                DispatchQueue.main.async { self.screenshotImage = image; self.endAction() }
+            } else { DispatchQueue.main.async { self.endAction() } }
+        } catch { DispatchQueue.main.async { self.endAction() } }
     }
+    
     func fetchCrashes() async {
         guard !ipAddress.isEmpty else { return }
         let client = APIClient(ipAddress: ipAddress, authToken: authToken)
-        do { let response = try await client.getCrashes(); DispatchQueue.main.async { self.crashes = response.crashes } } catch {}
+        do {
+            let response = try await client.getCrashes()
+            DispatchQueue.main.async { self.crashes = response.crashes }
+        } catch {}
+    }
+    
+    func restartRoblox() async {
+        startAction(name: "Restarting Roblox", estimatedSeconds: 15)
+        let client = APIClient(ipAddress: ipAddress, authToken: authToken)
+        do { _ = try await client.restart() } catch { DispatchQueue.main.async { self.endAction() } }
     }
 }
 
@@ -131,8 +212,6 @@ extension UserDefaults {
     }
     func setColor(_ color: Color, forKey key: String) {
         let uiColor = UIColor(color)
-        if let data = try? NSKeyedArchiver.archivedData(withRootObject: uiColor, requiringSecureCoding: false) {
-            set(data, forKey: key)
-        }
+        if let data = try? NSKeyedArchiver.archivedData(withRootObject: uiColor, requiringSecureCoding: false) { set(data, forKey: key) }
     }
 }

@@ -1,4 +1,5 @@
 import SwiftUI
+import UserNotifications
 
 struct ContentView: View {
     @EnvironmentObject var appState: AppState
@@ -28,5 +29,6 @@ struct ContentView: View {
         }
         .tint(appState.accentColor)
         .preferredColorScheme(appState.colorScheme)
+        .onAppear { appState.requestNotificationPermission() }
     }
 }

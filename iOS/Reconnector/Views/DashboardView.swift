@@ -63,7 +63,7 @@ struct DashboardView: View {
                         }
                         .frame(maxWidth: .infinity)
                     }
-                    Text("Reconnector v1.0.5").font(.caption2).foregroundColor(.secondary).padding(.top, 8)
+                    Text("Reconnector v1.0.6").font(.caption2).foregroundColor(.secondary).padding(.top, 8)
                 }
                 .padding(.horizontal, 20)
                 .padding(.top, 8)
