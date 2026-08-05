@@ -6,7 +6,7 @@ struct DashboardView: View {
     var body: some View {
         NavigationView {
             ScrollView {
-                VStack(spacing: 24) {
+                VStack(spacing: 20) {
                     if let status = appState.status {
                         // Status Card
                         VStack(spacing: 16) {
@@ -35,7 +35,6 @@ struct DashboardView: View {
                             StatCard(title: "Crashes", value: "\(status.crashes_today)", icon: "exclamationmark.triangle", color: .red)
                             StatCard(title: "Kicks", value: "\(status.kicks_today)", icon: "hand.raised", color: .yellow)
                         }
-                        .padding(.horizontal, 4)
                         
                         // System Info Card
                         VStack(alignment: .leading, spacing: 16) {
@@ -63,11 +62,9 @@ struct DashboardView: View {
                     } else {
                         // Loading State
                         VStack(spacing: 20) {
-                            Spacer()
-                                .frame(height: 60)
+                            Spacer().frame(height: 60)
                             
-                            ProgressView()
-                                .scaleEffect(1.5)
+                            ProgressView().scaleEffect(1.5)
                             
                             Text(appState.connectionError ?? "Connecting to backend...")
                                 .font(.subheadline)
@@ -75,7 +72,7 @@ struct DashboardView: View {
                                 .multilineTextAlignment(.center)
                                 .padding(.horizontal, 40)
                             
-                            if let error = appState.connectionError {
+                            if let _ = appState.connectionError {
                                 Button("Retry Connection") {
                                     appState.connectWebSocket()
                                 }
@@ -85,6 +82,12 @@ struct DashboardView: View {
                         }
                         .frame(maxWidth: .infinity)
                     }
+                    
+                    // Version footer
+                    Text("Reconnector v1.0.1")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .padding(.top, 8)
                 }
                 .padding(.horizontal, 20)
                 .padding(.top, 8)
@@ -93,6 +96,7 @@ struct DashboardView: View {
             .navigationTitle("Dashboard")
             .refreshable { await appState.fetchStatus() }
         }
+        .navigationViewStyle(.stack)
         .task { await appState.fetchStatus() }
     }
     
@@ -134,11 +138,9 @@ struct StatCard: View {
             Image(systemName: icon)
                 .font(.title)
                 .foregroundColor(color)
-            
             Text(value)
                 .font(.title3)
                 .fontWeight(.bold)
-            
             Text(title)
                 .font(.caption)
                 .foregroundColor(.secondary)
@@ -157,12 +159,9 @@ struct InfoRow: View {
     
     var body: some View {
         HStack {
-            Text(label)
-                .foregroundColor(.secondary)
+            Text(label).foregroundColor(.secondary)
             Spacer()
-            Text(value)
-                .foregroundColor(color)
-                .fontWeight(.medium)
+            Text(value).foregroundColor(color).fontWeight(.medium)
         }
     }
 }

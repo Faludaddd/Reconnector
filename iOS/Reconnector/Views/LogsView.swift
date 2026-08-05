@@ -60,6 +60,7 @@ struct LogsView: View {
                 }
             }
         }
+        .navigationViewStyle(.stack)
     }
     
     private func timeString(_ date: Date) -> String {

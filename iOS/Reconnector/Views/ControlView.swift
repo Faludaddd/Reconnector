@@ -172,6 +172,7 @@ struct ControlView: View {
                 }
             }
         }
+        .navigationViewStyle(.stack)
     }
 }
 
