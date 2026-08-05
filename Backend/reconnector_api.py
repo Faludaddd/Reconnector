@@ -1,8 +1,8 @@
 """
-Reconnector API Server v2
-=========================
-FastAPI backend that replaces discord.py. Runs on Termux.
-Exposes HTTP endpoints and a WebSocket for the iOS app to control the bot.
+Reconnector API Server v3 (Lightweight)
+=======================================
+Uses Python standard library only (no FastAPI/uvicorn/pydantic needed).
+This solves the Python 3.14 pydantic-core compilation issue on Termux.
 """
 import os
 import time
@@ -17,10 +17,9 @@ import io
 import base64
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-import uvicorn
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+import threading
 
 # ============================================================
 # CONFIG
@@ -54,18 +53,6 @@ DISCONNECT_KEYWORDS = [
 logger = logging.getLogger("reconnector")
 logger.setLevel(logging.INFO)
 _fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
-
-class WebSocketLogHandler(logging.Handler):
-    def __init__(self, manager):
-        super().__init__()
-        self.manager = manager
-    def emit(self, record):
-        msg = self.format(record)
-        try:
-            if self.manager._loop and self.manager._loop.is_running():
-                asyncio.run_coroutine_threadsafe(self.manager.broadcast({"type": "log", "data": msg, "timestamp": time.time()}), self.manager._loop)
-        except:
-            pass
 
 _sh = logging.StreamHandler(sys.stdout)
 _sh.setFormatter(_fmt)
@@ -105,7 +92,7 @@ class State:
     opt_no_bluetooth = False
 
 state = State()
-reconnect_lock = asyncio.Lock()
+reconnect_lock = threading.Lock()
 
 # ============================================================
 # SHELL / RISH HELPERS
@@ -117,10 +104,10 @@ def _run_cmd_sync(cmd, timeout=DEFAULT_TIMEOUT):
     except Exception:
         return ""
 
-async def run_cmd(cmd, timeout=DEFAULT_TIMEOUT):
-    return await asyncio.to_thread(_run_cmd_sync, cmd, timeout)
+def run_cmd_sync(cmd, timeout=DEFAULT_TIMEOUT):
+    return _run_cmd_sync(cmd, timeout)
 
-def _battery_sync():
+def get_battery_sync():
     try:
         result = subprocess.run(['rish', '-c', 'dumpsys battery | grep level'], capture_output=True, text=True, timeout=5)
         for line in result.stdout.splitlines():
@@ -130,19 +117,13 @@ def _battery_sync():
         return -1
     except: return -1
 
-async def get_battery():
-    return await asyncio.to_thread(_battery_sync)
-
-def _get_roblox_pid_sync():
+def get_roblox_pid_sync():
     try:
         result = subprocess.run(['rish', '-c', f'pidof {PACKAGE}'], capture_output=True, text=True, timeout=8)
         return result.stdout.strip()
     except: return ""
 
-async def get_roblox_pid():
-    return await asyncio.to_thread(_get_roblox_pid_sync)
-
-def _is_process_alive_sync(pid_str):
+def is_process_alive_sync(pid_str):
     if not pid_str: return False
     try:
         for pid in pid_str.split():
@@ -153,30 +134,27 @@ def _is_process_alive_sync(pid_str):
         return False
     except: return False
 
-async def is_process_alive(pid_str):
-    return await asyncio.to_thread(_is_process_alive_sync, pid_str)
-
-async def confirm_roblox_gone(rechecks=2, delay=5):
+def confirm_roblox_gone_sync(rechecks=2, delay=5):
     for i in range(rechecks):
-        pid = await get_roblox_pid()
-        if pid and await is_process_alive(pid): return False
-        if i < rechecks - 1: await asyncio.sleep(delay)
+        pid = get_roblox_pid_sync()
+        if pid and is_process_alive_sync(pid): return False
+        if i < rechecks - 1: time.sleep(delay)
     return True
 
-async def capture_and_check_disconnect():
+def capture_and_check_disconnect_sync():
     img_path = "/sdcard/rbx_watchdog.png"
-    text = await run_cmd(
+    text = _run_cmd_sync(
         f'screencap -p {img_path} && magick {img_path} -gravity Center -crop 40x40%+0+0 -resize 480x -colorspace Gray -threshold 50% png:- | tesseract stdin stdout --psm 3; rm -f {img_path}',
         timeout=20,
     )
     if any(w in text.lower() for w in DISCONNECT_KEYWORDS): return True
-    text2 = await run_cmd(
+    text2 = _run_cmd_sync(
         f'screencap -p {img_path} && magick {img_path} -gravity Center -crop 40x40%+0+0 -resize 480x -colorspace Gray -threshold 50% png:- | tesseract stdin stdout --psm 6; rm -f {img_path}',
         timeout=20,
     )
     return any(w in text2.lower() for w in DISCONNECT_KEYWORDS)
 
-def _get_system_info_sync():
+def get_system_info_sync():
     info = {"cpu_temp": None, "ram_total": None, "ram_free": None, "uptime": None}
     try:
         result = subprocess.run(['rish', '-c', 'cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null'], capture_output=True, text=True, timeout=3)
@@ -194,21 +172,17 @@ def _get_system_info_sync():
     except: pass
     return info
 
-async def get_system_info():
-    return await asyncio.to_thread(_get_system_info_sync)
-
-async def has_internet():
+def has_internet_sync():
     try:
-        result = await run_cmd('ping -c 1 -W 3 8.8.8.8', timeout=6)
-        return "1 received" in result or "1 packets received" in result
-    except:
-        return False
+        result = subprocess.run(['rish', '-c', 'ping -c 1 -W 3 8.8.8.8'], capture_output=True, text=True, timeout=6)
+        return result.returncode == 0
+    except: return False
 
 # ============================================================
 # RECONNECT LOGIC
 # ============================================================
-async def reconnect_game(reason="unknown", clear_cache=False):
-    async with reconnect_lock:
+def reconnect_game_sync(reason="unknown", clear_cache=False):
+    with reconnect_lock:
         recent = [t for t in state.reconnect_timestamps if time.time() - t < 60]
         if recent:
             logger.info("[SKIP] Reconnect already in progress")
@@ -235,34 +209,34 @@ async def reconnect_game(reason="unknown", clear_cache=False):
             if attempt > 0:
                 delay = backoff_delays[attempt]
                 logger.info(f"[RECONNECTOR] Attempt {attempt + 1}/{max_attempts} after {delay}s backoff...")
-                await asyncio.sleep(delay)
+                time.sleep(delay)
             else:
                 logger.info(f"[RECONNECTOR] Attempt 1/{max_attempts}...")
 
             logger.info("[RECONNECTOR] Step 1: Force-stopping Roblox...")
-            await run_cmd(f'am force-stop {PACKAGE}')
-            await asyncio.sleep(1)
+            _run_cmd_sync(f'am force-stop {PACKAGE}')
+            time.sleep(1)
 
-            pid_check = await get_roblox_pid()
+            pid_check = get_roblox_pid_sync()
             if pid_check:
                 logger.info(f"[RECONNECTOR] Step 2: Killing PID {pid_check.split()[0]}...")
-                await run_cmd(f'kill -9 {pid_check.split()[0]}')
-                await asyncio.sleep(0.5)
+                _run_cmd_sync(f'kill -9 {pid_check.split()[0]}')
+                time.sleep(0.5)
             else:
                 logger.info("[RECONNECTOR] Step 2: Roblox stopped cleanly")
 
             logger.info(f"[RECONNECTOR] Step 3: Launching Roblox ({launch_url})...")
-            await run_cmd(f'am start -a android.intent.action.VIEW -d "{launch_url}"')
+            _run_cmd_sync(f'am start -a android.intent.action.VIEW -d "{launch_url}"')
 
             logger.info("[RECONNECTOR] Step 4: Waiting for Roblox to start...")
             poll_deadline = time.time() + 30
-            await asyncio.sleep(3)
+            time.sleep(3)
             while time.time() < poll_deadline:
-                pid = await get_roblox_pid()
-                if pid and await is_process_alive(pid):
+                pid = get_roblox_pid_sync()
+                if pid and is_process_alive_sync(pid):
                     relaunched = True
                     break
-                await asyncio.sleep(1.5)
+                time.sleep(1.5)
 
             if relaunched:
                 logger.info(f"[RECONNECTOR] Recovery successful on attempt {attempt + 1}!")
@@ -275,12 +249,12 @@ async def reconnect_game(reason="unknown", clear_cache=False):
         state.roblox_state = "loading" if relaunched else "offline"
 
 # ============================================================
-# FAST DISCONNECT CHECKER (5s interval)
+# FAST DISCONNECT CHECKER (Background Thread)
 # ============================================================
-async def fast_disconnect_checker():
+def fast_disconnect_checker():
     logger.info("[STARTUP] Fast disconnect checker active (5s interval)")
     while True:
-        await asyncio.sleep(5)
+        time.sleep(5)
         if not state.watchdog_enabled: continue
         if state.last_reconnect_time > 0 and time.time() - state.last_reconnect_time < POST_RECONNECT_COOLDOWN_SEC: continue
         if state.roblox_state == "reconnecting": continue
@@ -290,54 +264,31 @@ async def fast_disconnect_checker():
                 with open(DISCONNECT_SIGNAL_FILE, 'r') as f: signal = f.read().strip()
                 os.remove(DISCONNECT_SIGNAL_FILE)
                 logger.warning(f"[FAST] Disconnect signal from Lua: {signal[:80]}")
-                await reconnect_game(reason="lua_disconnect_signal")
+                reconnect_game_sync(reason="lua_disconnect_signal")
                 continue
         except: pass
 
-        pid = await get_roblox_pid()
+        pid = get_roblox_pid_sync()
         if not pid: continue
 
-        if await capture_and_check_disconnect():
+        if capture_and_check_disconnect_sync():
             state.consecutive_ocr_hits += 1
             if state.consecutive_ocr_hits >= 2:
                 logger.warning("[FAST] 2 consecutive disconnect detections — reconnecting")
                 state.stats["kicks"] += 1
-                await reconnect_game(reason="ocr_disconnect_fast")
+                reconnect_game_sync(reason="ocr_disconnect_fast")
                 state.consecutive_ocr_hits = 0
         else:
             state.consecutive_ocr_hits = 0
 
 # ============================================================
-# WEBSOCKET MANAGER (Fixed: no auth required for local network)
+# HTTP SERVER
 # ============================================================
-class WebSocketManager:
-    def __init__(self):
-        self.active_connections = []
-        self._loop = None
-    async def connect(self, ws: WebSocket):
-        await ws.accept()
-        self.active_connections.append(ws)
-        self._loop = asyncio.get_event_loop()
-        logger.info(f"[WS] Client connected. Total: {len(self.active_connections)}")
-    def disconnect(self, ws: WebSocket):
-        if ws in self.active_connections: self.active_connections.remove(ws)
-        logger.info(f"[WS] Client disconnected. Total: {len(self.active_connections)}")
-    async def broadcast(self, msg: dict):
-        for c in self.active_connections[:]:
-            try: await c.send_json(msg)
-            except: self.disconnect(c)
-
-ws_manager = WebSocketManager()
-logger.addHandler(WebSocketLogHandler(ws_manager))
-
-# ============================================================
-# FASTAPI APP
-# ============================================================
-app = FastAPI(title="Reconnector API")
-
-@app.get("/api/status")
-async def get_status():
-    battery, sys_info, pid, online = await asyncio.gather(get_battery(), get_system_info(), get_roblox_pid(), has_internet())
+def get_status_dict():
+    battery = get_battery_sync()
+    sys_info = get_system_info_sync()
+    pid = get_roblox_pid_sync()
+    online = has_internet_sync()
     elapsed = int(time.time() - state.bot_first_start_time)
     return {
         "roblox_state": state.roblox_state,
@@ -368,111 +319,120 @@ async def get_status():
         }
     }
 
-@app.get("/api/crashes")
-async def get_crashes():
-    return {"crashes": state.crash_log[:20]}
+class RequestHandler(BaseHTTPRequestHandler):
+    def _send_json(self, data, code=200):
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode('utf-8'))
 
-@app.post("/api/restart")
-async def restart_roblox():
-    asyncio.create_task(reconnect_game(reason="manual_restart", clear_cache=True))
-    return {"status": "initiated"}
+    def _read_body(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        if content_length > 0:
+            return json.loads(self.rfile.read(content_length).decode('utf-8'))
+        return {}
 
-@app.get("/api/screenshot")
-async def screenshot():
-    img_path = "/sdcard/rbx_manual.png"
-    await run_cmd(f'screencap -p {img_path}')
-    try:
-        with open(img_path, 'rb') as f:
-            img_data = base64.b64encode(f.read()).decode('utf-8')
-        await run_cmd(f'rm -f {img_path}')
-        return {"image": img_data}
-    except Exception as e:
-        return {"error": str(e), "image": ""}
+    def do_OPTIONS(self):
+        self._send_json({"status": "ok"})
 
-@app.post("/api/black-screen")
-async def black_screen():
-    html = '<html><body bgcolor="black"><div style="position:fixed;top:20px;right:20px;width:50px;height:50px;background:rgba(255,255,255,0.1);border-radius:50%;display:flex;align-items:center;justify-content:center;color:white;font-size:24px;cursor:pointer;" onclick="history.back()">×</div></body></html>'
-    with open("/sdcard/black.html", "w") as f: f.write(html)
-    await run_cmd('am start -a android.intent.action.VIEW -d "file:///sdcard/black.html" -t "text/html"')
-    return {"status": "ok"}
-
-@app.post("/api/brightness/{level}")
-async def set_brightness(level: int):
-    state.brightness_level = level
-    await run_cmd(f'settings put system screen_brightness {level}')
-    return {"status": "ok"}
-
-@app.post("/api/watchdog/toggle")
-async def toggle_watchdog():
-    state.watchdog_enabled = not state.watchdog_enabled
-    return {"status": "ok", "enabled": state.watchdog_enabled}
-
-@app.post("/api/clear-anti-loop")
-async def clear_anti_loop():
-    state.reconnect_timestamps = []
-    state.is_paused = False
-    return {"status": "ok"}
-
-@app.post("/api/optimize/{name}")
-async def toggle_optimize(name: str, request: Request):
-    data = await request.json()
-    enabled = data.get("enabled", False)
-    if name == "kill_bg": state.opt_kill_bg = enabled
-    elif name == "process_limit": state.opt_process_limit = enabled
-    elif name == "no_animations": state.opt_no_animations = enabled
-    elif name == "force_gpu": state.opt_force_gpu = enabled
-    elif name == "no_bluetooth": state.opt_no_bluetooth = enabled
-    return {"status": "ok"}
-
-class GameLinkModel(BaseModel):
-    url: str
-
-@app.post("/api/game-link")
-async def set_game_link(data: GameLinkModel):
-    state.current_game_link = data.url
-    return {"status": "ok"}
-
-@app.post("/api/interval/{minutes}")
-async def set_interval(minutes: int):
-    state.watchdog_interval_minutes = minutes
-    return {"status": "ok"}
-
-@app.get("/api/logs")
-async def get_logs():
-    try:
-        with open(LOG_FILE, 'r') as f: lines = f.readlines()[-100:]
-        return {"logs": lines}
-    except: return {"logs": []}
-
-# WebSocket - NO AUTH REQUIRED (local network only)
-@app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    await ws_manager.connect(ws)
-    try:
-        # Send initial status immediately
-        status = await get_status()
-        await ws.send_json({"type": "status", "data": status, "timestamp": time.time()})
+    def do_GET(self):
+        path = self.path.split('?')[0]
         
-        # Keep connection alive with periodic status updates
-        while True:
-            await asyncio.sleep(5)
-            status = await get_status()
-            await ws.send_json({"type": "status", "data": status, "timestamp": time.time()})
-    except WebSocketDisconnect:
-        ws_manager.disconnect(ws)
-    except Exception as e:
-        logger.warning(f"[WS] Error: {e}")
-        ws_manager.disconnect(ws)
+        if path == '/api/status':
+            self._send_json(get_status_dict())
+        elif path == '/api/crashes':
+            self._send_json({"crashes": state.crash_log[:20]})
+        elif path == '/api/screenshot':
+            img_path = "/sdcard/rbx_manual.png"
+            _run_cmd_sync(f'screencap -p {img_path}')
+            try:
+                with open(img_path, 'rb') as f:
+                    img_data = base64.b64encode(f.read()).decode('utf-8')
+                _run_cmd_sync(f'rm -f {img_path}')
+                self._send_json({"image": img_data, "error": None})
+            except Exception as e:
+                self._send_json({"image": "", "error": str(e)})
+        elif path == '/api/logs':
+            try:
+                with open(LOG_FILE, 'r') as f: lines = f.readlines()[-100:]
+                self._send_json({"logs": lines})
+            except:
+                self._send_json({"logs": []})
+        else:
+            self._send_json({"error": "Not found"}, 404)
+
+    def do_POST(self):
+        path = self.path.split('?')[0]
+        body = self._read_body()
+        
+        if path == '/api/restart':
+            threading.Thread(target=reconnect_game_sync, args=("manual_restart", True), daemon=True).start()
+            self._send_json({"status": "initiated"})
+        elif path == '/api/black-screen':
+            html = '<html><body bgcolor="black"><div style="position:fixed;top:20px;right:20px;width:50px;height:50px;background:rgba(255,255,255,0.1);border-radius:50%;display:flex;align-items:center;justify-content:center;color:white;font-size:24px;cursor:pointer;" onclick="history.back()">×</div></body></html>'
+            with open("/sdcard/black.html", "w") as f: f.write(html)
+            _run_cmd_sync('am start -a android.intent.action.VIEW -d "file:///sdcard/black.html" -t "text/html"')
+            self._send_json({"status": "ok"})
+        elif path == '/api/watchdog/toggle':
+            state.watchdog_enabled = not state.watchdog_enabled
+            self._send_json({"status": "ok", "enabled": state.watchdog_enabled})
+        elif path == '/api/clear-anti-loop':
+            state.reconnect_timestamps = []
+            state.is_paused = False
+            self._send_json({"status": "ok"})
+        elif path.startswith('/api/brightness/'):
+            level = int(path.split('/')[-1])
+            state.brightness_level = level
+            _run_cmd_sync(f'settings put system screen_brightness {level}')
+            self._send_json({"status": "ok"})
+        elif path.startswith('/api/interval/'):
+            minutes = int(path.split('/')[-1])
+            state.watchdog_interval_minutes = minutes
+            self._send_json({"status": "ok"})
+        elif path == '/api/game-link':
+            state.current_game_link = body.get('url', '')
+            self._send_json({"status": "ok"})
+        elif path.startswith('/api/optimize/'):
+            name = path.split('/')[-1]
+            enabled = body.get('enabled', False)
+            if name == "kill_bg": state.opt_kill_bg = enabled
+            elif name == "process_limit": state.opt_process_limit = enabled
+            elif name == "no_animations": state.opt_no_animations = enabled
+            elif name == "force_gpu": state.opt_force_gpu = enabled
+            elif name == "no_bluetooth": state.opt_no_bluetooth = enabled
+            self._send_json({"status": "ok"})
+        else:
+            self._send_json({"error": "Not found"}, 404)
+
+    def log_message(self, format, *args):
+        pass  # Suppress default HTTP logging
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    pass
 
 # ============================================================
 # STARTUP
 # ============================================================
-@app.on_event("startup")
-async def startup_event():
-    logger.info("[STARTUP] Reconnector API v2 starting...")
+def main():
+    logger.info("[STARTUP] Reconnector API v3 starting (Lightweight HTTP Server)...")
     logger.info(f"[STARTUP] Auth token: {AUTH_TOKEN[:4]}...")
-    logger.info("[STARTUP] WebSocket: NO AUTH REQUIRED (local network)")
-    asyncio.create_task(fast_disconnect_checker())
+    
+    # Start disconnect checker in background
+    checker_thread = threading.Thread(target=fast_disconnect_checker, daemon=True)
+    checker_thread.start()
+    
+    # Start HTTP server
+    server = ThreadedHTTPServer((HOST, PORT), RequestHandler)
+    logger.info(f"[STARTUP] Server running on http://{HOST}:{PORT}")
+    
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("[SHUTDOWN] Server stopped")
+        server.shutdown()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=HOST, port=PORT)
+    main()

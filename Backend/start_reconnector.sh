@@ -1,5 +1,5 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# Reconnector API Launcher
+# Reconnector API Launcher (v3 - Lightweight)
 set -u
 
 BOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
