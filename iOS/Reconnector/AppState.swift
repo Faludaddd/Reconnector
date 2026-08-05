@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UIKit
 
 class AppState: ObservableObject {
     @Published var ipAddress: String = UserDefaults.standard.string(forKey: "ipAddress") ?? ""
@@ -96,7 +97,7 @@ class AppState: ObservableObject {
         let client = APIClient(ipAddress: ipAddress, authToken: authToken)
         do {
             let response = try await client.getScreenshot()
-            if let imageData = Data(base64Encoded: response.image), let image = UIImage(data: imageData) {
+            if let imageData = Data(base64Encoded: response.image), let image = UIImage(data: imageData) { {
                 DispatchQueue.main.async { self.screenshotImage = image }
             }
         } catch {

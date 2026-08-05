@@ -73,19 +73,19 @@ struct ControlView: View {
                     VStack(alignment: .leading, spacing: 15) {
                         Text("Optimizations").font(.headline)
                         if let opts = appState.status?.optimizations {
-                            ToggleRow(title: "Kill BG Apps", isOn: opts.kill_bg) {
+                            ToggleRow(title: "Kill BG Apps", isOn: opts.kill_bg) { @MainActor in
                                 Task { try? await APIClient(ipAddress: appState.ipAddress, authToken: appState.authToken).toggleOptimization(name: "kill_bg", enabled: !opts.kill_bg) }
                             }
-                            ToggleRow(title: "Process Limit", isOn: opts.process_limit) {
+                            ToggleRow(title: "Process Limit", isOn: opts.process_limit) { @MainActor in
                                 Task { try? await APIClient(ipAddress: appState.ipAddress, authToken: appState.authToken).toggleOptimization(name: "process_limit", enabled: !opts.process_limit) }
                             }
-                            ToggleRow(title: "No Animations", isOn: opts.no_animations) {
+                            ToggleRow(title: "No Animations", isOn: opts.no_animations) { @MainActor in
                                 Task { try? await APIClient(ipAddress: appState.ipAddress, authToken: appState.authToken).toggleOptimization(name: "no_animations", enabled: !opts.no_animations) }
                             }
-                            ToggleRow(title: "Force GPU", isOn: opts.force_gpu) {
+                            ToggleRow(title: "Force GPU", isOn: opts.force_gpu) { @MainActor in
                                 Task { try? await APIClient(ipAddress: appState.ipAddress, authToken: appState.authToken).toggleOptimization(name: "force_gpu", enabled: !opts.force_gpu) }
                             }
-                            ToggleRow(title: "No Bluetooth", isOn: opts.no_bluetooth) {
+                            ToggleRow(title: "No Bluetooth", isOn: opts.no_bluetooth) { @MainActor in
                                 Task { try? await APIClient(ipAddress: appState.ipAddress, authToken: appState.authToken).toggleOptimization(name: "no_bluetooth", enabled: !opts.no_bluetooth) }
                             }
                         }
