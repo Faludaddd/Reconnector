@@ -42,7 +42,7 @@ struct MonitoringView: View {
                             InfoRow(label: "Network Drops", value: "\(status.network_drops ?? 0)", color: .orange)
                             InfoRow(label: "Bot Uptime", value: formatUptime(status.bot_uptime ?? 0), color: .blue)
                             if let lastReconnect = status.last_reconnect, lastReconnect > 0 {
-                                InfoRow(label: "Last Reconnect", value: Date(timeIntervalSince1970: TimeInterval(lastReconnect), style: .relative), color: .secondary)
+                                let date = Date(timeIntervalSince1970: TimeInterval(lastReconnect)); InfoRow(label: "Last Reconnect", value: date.formatted(.relative(presentation: .named)), color: .secondary)
                             }
                         }
                         .padding(20)
