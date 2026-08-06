@@ -20,7 +20,7 @@ class AppState: ObservableObject {
     @Published var ipAddress: String = UserDefaults.standard.string(forKey: "ipAddress") ?? "" {
         didSet { UserDefaults.standard.set(ipAddress, forKey: "ipAddress") }
     }
-    @Published var authToken: String = UserDefaults.standard.string(forKey: "authToken") ?? "reconnector123" {
+    @Published var authToken: String = UserDefaults.standard.string(forKey: "authToken") ?? "" {
         didSet { UserDefaults.standard.set(authToken, forKey: "authToken") }
     }
 
@@ -133,7 +133,7 @@ class AppState: ObservableObject {
         for k in keys { UserDefaults.standard.removeObject(forKey: k) }
         UserDefaults.standard.synchronize()
         ipAddress = ""
-        authToken = "reconnector123"
+        authToken = ""
         notifyOnDisconnect = true
         notifyOnReconnect = true
         notifyOnError = true
@@ -168,6 +168,21 @@ class AppState: ObservableObject {
     }
 
     func reconnect() { startPolling() }
+
+    // MARK: - Authenticated request helper
+    // v9+ backend requires Authorization: Bearer <token> on every request.
+    // This helper builds a URLRequest with the auth header pre-set so every
+    // call site stays consistent.
+    private func makeRequest(path: String, method: String = "GET") -> URLRequest {
+        let url = URL(string: "http://\(ipAddress):8080\(path)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        if !authToken.isEmpty {
+            request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        }
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return request
+    }
 
     // MARK: - Notifications
     func requestNotificationPermission() {
@@ -231,8 +246,7 @@ class AppState: ObservableObject {
     // MARK: - Status polling
     private func fetchStatusNow() {
         guard !ipAddress.isEmpty else { return }
-        let url = URL(string: "http://\(ipAddress):8080/api/status")!
-        var request = URLRequest(url: url)
+        var request = makeRequest(path: "/api/status")
         request.timeoutInterval = 12  // backend is fast now (<100ms) but allow headroom
         URLSession.shared.dataTask(with: request) { data, response, error in
             DispatchQueue.main.async {
@@ -254,7 +268,11 @@ class AppState: ObservableObject {
                     self.handleStatusFailure(error)
                 } else if let code = http?.statusCode {
                     // Got a response but it's a 4xx/5xx — treat as failure
-                    self.connectionError = "Backend error (HTTP \(code))"
+                    if code == 401 {
+                        self.connectionError = "Authentication failed — check API key in Settings"
+                    } else {
+                        self.connectionError = "Backend error (HTTP \(code))"
+                    }
                     self.handleStatusFailure(nil)
                 } else {
                     self.handleStatusFailure(error)
@@ -311,8 +329,7 @@ class AppState: ObservableObject {
     // MARK: - Logs polling
     private func fetchLogsNow() {
         guard !ipAddress.isEmpty else { return }
-        let url = URL(string: "http://\(ipAddress):8080/api/logs")!
-        var request = URLRequest(url: url)
+        var request = makeRequest(path: "/api/logs")
         request.timeoutInterval = 8
         URLSession.shared.dataTask(with: request) { data, response, _ in
             // Source of truth: HTTP 2xx = connected
@@ -336,9 +353,7 @@ class AppState: ObservableObject {
     func clearLogs() {
         logs.removeAll()
         guard !ipAddress.isEmpty else { return }
-        let url = URL(string: "http://\(ipAddress):8080/api/clear-logs")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
+        var request = makeRequest(path: "/api/clear-logs")
         request.timeoutInterval = 5
         URLSession.shared.dataTask(with: request) { _, _, _ in
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -387,9 +402,7 @@ class AppState: ObservableObject {
     func toggleWatchdog() {
         let oldValue = watchdogEnabled
         watchdogEnabled.toggle()
-        let url = URL(string: "http://\(ipAddress):8080/api/watchdog/toggle")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
+        var request = makeRequest(path: "/api/watchdog/toggle", method: "POST")
         request.timeoutInterval = 8
         URLSession.shared.dataTask(with: request) { data, response, _ in
             DispatchQueue.main.async {
@@ -422,10 +435,7 @@ class AppState: ObservableObject {
         // Mark this toggle as "in-flight" so polling doesn't clobber it
         pendingOptimizationToggles.insert(name)
 
-        let url = URL(string: "http://\(ipAddress):8080/api/optimize/\(name)")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        var request = makeRequest(path: "/api/optimize/\(name)", method: "POST")
         request.httpBody = try? JSONSerialization.data(withJSONObject: ["enabled": newValue])
         request.timeoutInterval = 10
 
@@ -467,9 +477,7 @@ class AppState: ObservableObject {
     // MARK: - Restart Roblox
     func restartRoblox() {
         startAction(name: "Restarting Roblox", estimatedSeconds: 15)
-        let url = URL(string: "http://\(ipAddress):8080/api/restart")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
+        var request = makeRequest(path: "/api/restart", method: "POST")
         request.timeoutInterval = 30
         URLSession.shared.dataTask(with: request) { data, response, error in
             DispatchQueue.main.async {
@@ -486,8 +494,7 @@ class AppState: ObservableObject {
     private func waitForRestartCompletion(maxSeconds: Int) {
         let start = Date()
         func check() {
-            let url = URL(string: "http://\(ipAddress):8080/api/status")!
-            var req = URLRequest(url: url)
+            var req = makeRequest(path: "/api/status")
             req.timeoutInterval = 6
             URLSession.shared.dataTask(with: req) { data, _, _ in
                 DispatchQueue.main.async {
@@ -522,8 +529,8 @@ class AppState: ObservableObject {
     // MARK: - Screenshot
     func fetchScreenshot() {
         startAction(name: "Capturing Screenshot", estimatedSeconds: 4)
-        let url = URL(string: "http://\(ipAddress):8080/api/screenshot")!
-        URLSession.shared.dataTask(with: url) { data, _, _ in
+        let request = makeRequest(path: "/api/screenshot")
+        URLSession.shared.dataTask(with: request) { data, _, _ in
             DispatchQueue.main.async {
                 if let data = data,
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -543,8 +550,8 @@ class AppState: ObservableObject {
     // MARK: - 3-second video (just record + display + log)
     func fetchVideo() {
         startAction(name: "Recording 3s Video", estimatedSeconds: 6)
-        let url = URL(string: "http://\(ipAddress):8080/api/video")!
-        URLSession.shared.dataTask(with: url) { data, _, _ in
+        let request = makeRequest(path: "/api/video")
+        URLSession.shared.dataTask(with: request) { data, _, _ in
             DispatchQueue.main.async {
                 if let data = data,
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -564,8 +571,8 @@ class AppState: ObservableObject {
     // MARK: - Crashes
     func fetchCrashes() {
         guard !ipAddress.isEmpty else { return }
-        let url = URL(string: "http://\(ipAddress):8080/api/crashes")!
-        URLSession.shared.dataTask(with: url) { data, _, _ in
+        let request = makeRequest(path: "/api/crashes")
+        URLSession.shared.dataTask(with: request) { data, _, _ in
             guard let data = data,
                   let response = try? JSONDecoder().decode(CrashResponse.self, from: data) else { return }
             DispatchQueue.main.async {
@@ -578,9 +585,7 @@ class AppState: ObservableObject {
     // MARK: - Clear anti-loop
     func clearAntiLoop() {
         guard !ipAddress.isEmpty else { return }
-        let url = URL(string: "http://\(ipAddress):8080/api/clear-anti-loop")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
+        var request = makeRequest(path: "/api/clear-anti-loop", method: "POST")
         request.timeoutInterval = 8
         URLSession.shared.dataTask(with: request) { _, _, _ in
             DispatchQueue.main.async { self.markConnected() }
@@ -590,10 +595,7 @@ class AppState: ObservableObject {
     // MARK: - Game link
     func setGameLink(_ link: String, completion: @escaping (Bool) -> Void) {
         guard !ipAddress.isEmpty else { completion(false); return }
-        let url = URL(string: "http://\(ipAddress):8080/api/game-link")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        var request = makeRequest(path: "/api/game-link", method: "POST")
         request.httpBody = try? JSONSerialization.data(withJSONObject: ["url": link])
         request.timeoutInterval = 8
         URLSession.shared.dataTask(with: request) { data, response, _ in
@@ -617,9 +619,7 @@ class AppState: ObservableObject {
         guard !ipAddress.isEmpty else { return }
         let oldValue = watchdogInterval
         watchdogInterval = minutes
-        let url = URL(string: "http://\(ipAddress):8080/api/interval/\(minutes)")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
+        var request = makeRequest(path: "/api/interval/\(minutes)", method: "POST")
         request.timeoutInterval = 8
         URLSession.shared.dataTask(with: request) { data, response, _ in
             DispatchQueue.main.async {

@@ -1,12 +1,17 @@
 """
-Reconnector API Server v8
+Reconnector API Server v9
 - Single intelligent recovery flow (no multi-attempt logs)
 - Smart watchdog state machine (no false positives during launches)
 - Background-cached system info (battery/internet/temp/uptime) — status endpoint <100ms
 - Stable log clearing
 - All endpoints echo state for client confirmation
+- Mandatory Bearer-token authentication on every request
+- Crash classification: distinguishes kicks vs network drops
+- screenrecord uses --size 1280x720 (native res fails on this tablet's encoder)
+- Watchdog interval changes take effect within 5s (non-blocking sleep)
+- Filename-randomized screenshot/video to avoid concurrent-request races
 """
-import os, time, subprocess, json, re, logging, sys, base64, threading
+import os, time, subprocess, json, re, logging, sys, base64, threading, uuid, secrets
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -19,6 +24,38 @@ DISCONNECT_SIGNAL_FILE = "/sdcard/AE_disconnect_signal.txt"
 HOST = "0.0.0.0"
 PORT = 8080
 DEFAULT_TIMEOUT = 15
+API_KEY_FILE = f"{BASE_DIR}/.reconnector_api_key"
+
+
+def _load_or_create_api_key():
+    """Persistent random API key, generated once and reused across
+    restarts. Every request must present it - without this, ANY device
+    on the same network (or the internet, if this port is ever exposed
+    beyond home WiFi, which is the explicit goal of the iOS app) could
+    force-restart the bot, change the game link, toggle optimizations,
+    or pull screenshots/video with zero authentication at all."""
+    env_key = os.environ.get("RECONNECTOR_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    try:
+        if os.path.exists(API_KEY_FILE):
+            with open(API_KEY_FILE, 'r') as f:
+                existing = f.read().strip()
+            if existing:
+                return existing
+    except Exception:
+        pass
+    new_key = secrets.token_hex(24)
+    try:
+        with open(API_KEY_FILE, 'w') as f:
+            f.write(new_key)
+        os.chmod(API_KEY_FILE, 0o600)
+    except Exception:
+        pass
+    return new_key
+
+
+API_KEY = _load_or_create_api_key()
 
 # How long after a reconnect before we trust Roblox is healthy.
 POST_RECONNECT_GRACE_SEC = 60
@@ -27,12 +64,29 @@ DEATH_CONFIRMATION_SEC = 20
 # Background refresh interval for slow system queries.
 SYS_REFRESH_INTERVAL_SEC = 15
 
-DISCONNECT_KEYWORDS = [
-    "disconnected", "reconnect unsuccessful", "lost connection",
-    "failed to connect", "connection lost", "you have been kicked",
-    "please rejoin", "has been removed", "experience failed to load",
+NETWORK_DROP_KEYWORDS = [
+    "lost connection", "failed to connect", "connection lost",
     "the connection to the server was lost", "your connection has timed out",
+    "reconnect unsuccessful",
 ]
+KICK_KEYWORDS = [
+    "you have been kicked", "please rejoin", "has been removed",
+    "experience failed to load",
+]
+DISCONNECT_KEYWORDS = NETWORK_DROP_KEYWORDS + KICK_KEYWORDS + ["disconnected"]
+
+
+def _classify_disconnect_text(text):
+    """Which category a matched disconnect text actually belongs to, so
+    stats aren't all lumped under 'kicks' regardless of actual cause."""
+    lower = text.lower()
+    for kw in KICK_KEYWORDS:
+        if kw in lower:
+            return "kicks"
+    for kw in NETWORK_DROP_KEYWORDS:
+        if kw in lower:
+            return "network_drops"
+    return "kicks"  # bare "disconnected" - ambiguous, default to kicks
 
 logger = logging.getLogger("reconnector")
 logger.setLevel(logging.INFO)
@@ -69,7 +123,7 @@ class State:
     opt_no_bluetooth = False
 
     # Watchdog tracking
-    last_pid_seen_time = 0
+    last_pid_seen_time = time.time()
     last_lua_signal_time = 0
     recovery_in_progress = False
 
@@ -218,18 +272,25 @@ def refresh_system_info_loop():
 
 
 def capture_and_check_disconnect():
+    """Returns the matched keyword text, or None if no disconnect text found."""
     img_path = "/sdcard/rbx_watchdog.png"
     text = _run_cmd(
         f'screencap -p {img_path} && magick {img_path} -gravity Center -crop 40x40%+0+0 -resize 480x '
         f'-colorspace Gray -threshold 50% png:- | tesseract stdin stdout --psm 3; rm -f {img_path}',
         timeout=20)
-    if any(w in text.lower() for w in DISCONNECT_KEYWORDS):
-        return True
+    lower = text.lower()
+    for w in DISCONNECT_KEYWORDS:
+        if w in lower:
+            return w
     text2 = _run_cmd(
         f'screencap -p {img_path} && magick {img_path} -gravity Center -crop 40x40%+0+0 -resize 480x '
         f'-colorspace Gray -threshold 50% png:- | tesseract stdin stdout --psm 6; rm -f {img_path}',
         timeout=20)
-    return any(w in text2.lower() for w in DISCONNECT_KEYWORDS)
+    lower2 = text2.lower()
+    for w in DISCONNECT_KEYWORDS:
+        if w in lower2:
+            return w
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -350,19 +411,27 @@ def record_3s_video():
     video_path = "/sdcard/rbx_3s_video.mp4"
     _run_cmd(f'rm -f {video_path}')
     logger.info("[VIDEO] Recording 3-second video...")
-    _run_cmd(f'screenrecord --time-limit 3 {video_path}', timeout=10)
-    time.sleep(1)
+    # --size 1280x720 is required on this device: native resolution
+    # (1920x1200) fails to allocate the hardware encoder (err=-12) and
+    # screenrecord exits instantly with no output file at all - confirmed
+    # by direct on-device testing, not a guess.
+    result = _run_cmd(f'screenrecord --time-limit 3 --size 1280x720 {video_path}', timeout=18)
+    if not os.path.exists(video_path):
+        logger.error(f"[VIDEO] No output file produced. screenrecord output: {result[:300]!r}")
+        return ""
+    size = os.path.getsize(video_path)
+    if size < 15000:
+        logger.error(f"[VIDEO] Output too small ({size} bytes) - likely incomplete")
+        _run_cmd(f'rm -f {video_path}')
+        return ""
     try:
         with open(video_path, 'rb') as f:
             video_data = base64.b64encode(f.read()).decode('utf-8')
         _run_cmd(f'rm -f {video_path}')
-        if video_data:
-            logger.info(f"[VIDEO] Recorded ({len(video_data)} bytes b64)")
-        else:
-            logger.error("[VIDEO] Empty file")
+        logger.info(f"[VIDEO] Recorded ({size} bytes raw, {len(video_data)} bytes b64)")
         return video_data
     except Exception as e:
-        logger.error(f"[VIDEO] Failed: {e}")
+        logger.error(f"[VIDEO] Read failed: {e}")
         return ""
 
 
@@ -416,9 +485,8 @@ def evaluate_roblox_health():
     - In post-reconnect grace → healthy
     - Recovery in progress → skip
     - Both PID + activity alive → check OCR for disconnect text
-    - PID alive but activity stopped → transitioning, wait
-    - No PID for >20s and activity stopped → recovery needed
-    - Brief PID miss during launch → skip
+    - PID alive but activity stopped (or vice versa) → transitioning, wait
+    - Neither alive for >= DEATH_CONFIRMATION_SEC → recovery needed
     """
     # Signal 1: Lua disconnect file (highest priority)
     try:
@@ -450,45 +518,42 @@ def evaluate_roblox_health():
 
     # CASE A: Roblox is fully alive (PID + activity both agree)
     if pid_alive and activity_state in ("foreground", "background"):
-        # OCR disconnect check only if in foreground
         if activity_state == "foreground":
-            if capture_and_check_disconnect():
+            matched = capture_and_check_disconnect()
+            if matched:
                 state.consecutive_ocr_hits += 1
-                logger.warning(f"[WATCHDOG] Disconnect text (consecutive: {state.consecutive_ocr_hits})")
+                logger.warning(f"[WATCHDOG] Disconnect text (consecutive: {state.consecutive_ocr_hits}): {matched!r}")
                 if state.consecutive_ocr_hits >= 2:
-                    state.stats["kicks"] += 1
                     state.consecutive_ocr_hits = 0
-                    return True, "ocr_disconnect"
+                    category = _classify_disconnect_text(matched)
+                    state.stats[category] += 1
+                    return True, f"ocr_disconnect_{category}"
             else:
                 state.consecutive_ocr_hits = 0
         _set_state("healthy")
         return False, "healthy"
 
-    # CASE B: Roblox is in a transitional state (PID alive but activity stopped, or vice versa)
-    # This happens during launches, backgrounding, etc. — DON'T trigger recovery.
-    if pid_alive or activity_state != "stopped":
-        time_since_pid = time.time() - state.last_pid_seen_time if state.last_pid_seen_time > 0 else 0
-        if time_since_pid < DEATH_CONFIRMATION_SEC:
-            logger.info(f"[WATCHDOG] Transitional state (pid={pid_alive}, act={activity_state}) — waiting")
-            return False, "transitioning"
-        # If we haven't seen a PID in a while and activity is also stopped, recovery is needed
-        if not pid_alive and activity_state == "stopped" and time_since_pid >= DEATH_CONFIRMATION_SEC:
-            logger.warning(f"[WATCHDOG] Roblox closed (no PID for {int(time_since_pid)}s, no activity)")
-            return True, "process_closed"
-    else:
-        # CASE C: No PID and activity is stopped — but only recover if we've been dead long enough
-        time_since_pid = time.time() - state.last_pid_seen_time if state.last_pid_seen_time > 0 else 999
-        if time_since_pid >= DEATH_CONFIRMATION_SEC:
-            logger.warning(f"[WATCHDOG] Roblox closed (no PID for {int(time_since_pid)}s)")
-            return True, "process_closed"
+    # CASE B: not fully confirmed alive - either genuinely dead, or mid-transition
+    # (launching, backgrounding, etc). Distinguish by how long it's been since we
+    # last saw a live PID, using one consistent grace window either way.
+    time_since_pid = time.time() - state.last_pid_seen_time
+    if time_since_pid < DEATH_CONFIRMATION_SEC:
+        logger.info(f"[WATCHDOG] Transitional state (pid={pid_alive}, act={activity_state}) — waiting")
+        return False, "transitioning"
 
-    return False, "unknown_healthy"
+    logger.warning(f"[WATCHDOG] Roblox closed (no confirmed-alive PID for {int(time_since_pid)}s, activity={activity_state})")
+    return True, "process_closed"
 
 
 def watchdog_loop():
     logger.info("[STARTUP] Watchdog started (smart state machine)")
+    last_check = 0
     while True:
-        time.sleep(state.watchdog_interval_minutes * 60)
+        time.sleep(5)
+        interval_sec = max(30, state.watchdog_interval_minutes * 60)
+        if time.time() - last_check < interval_sec:
+            continue
+        last_check = time.time()
         if not state.watchdog_enabled:
             continue
         try:
@@ -528,12 +593,14 @@ def fast_disconnect_checker():
             if get_roblox_activity_state() != "foreground":
                 continue
 
-            if capture_and_check_disconnect():
+            matched = capture_and_check_disconnect()
+            if matched:
                 state.consecutive_ocr_hits += 1
                 if state.consecutive_ocr_hits >= 2:
-                    logger.warning("[FAST] 2 consecutive OCR hits — reconnecting")
-                    state.stats["kicks"] += 1
-                    reconnect_game(reason="ocr_disconnect_fast")
+                    category = _classify_disconnect_text(matched)
+                    logger.warning(f"[FAST] 2 consecutive OCR hits ({category}) — reconnecting")
+                    state.stats[category] += 1
+                    reconnect_game(reason=f"ocr_disconnect_fast_{category}")
                     state.consecutive_ocr_hits = 0
             else:
                 state.consecutive_ocr_hits = 0
@@ -609,25 +676,34 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return {}
         return {}
 
+    def _authorized(self):
+        auth = self.headers.get('Authorization', '')
+        presented = auth[7:] if auth.startswith('Bearer ') else auth
+        return secrets.compare_digest(presented, API_KEY)
+
     def do_OPTIONS(self):
         self._send_json({"status": "ok"})
 
     def do_GET(self):
         path = self.path.split('?')[0]
+        if not self._authorized():
+            self._send_json({"error": "Unauthorized"}, 401)
+            return
         if path == '/api/status':
             self._send_json(get_status_dict())
         elif path == '/api/crashes':
             self._send_json({"crashes": state.crash_log[:20]})
         elif path == '/api/screenshot':
-            img_path = "/sdcard/rbx_manual.png"
+            img_path = f"/sdcard/rbx_manual_{uuid.uuid4().hex[:8]}.png"
             _run_cmd(f'screencap -p {img_path}')
             try:
                 with open(img_path, 'rb') as f:
                     img_data = base64.b64encode(f.read()).decode('utf-8')
-                _run_cmd(f'rm -f {img_path}')
                 self._send_json({"image": img_data, "error": None})
             except Exception as e:
                 self._send_json({"image": "", "error": str(e)})
+            finally:
+                _run_cmd(f'rm -f {img_path}')
         elif path == '/api/video':
             video_data = record_3s_video()
             self._send_json({"video": video_data, "error": None if video_data else "Failed"})
@@ -649,6 +725,9 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split('?')[0]
+        if not self._authorized():
+            self._send_json({"error": "Unauthorized"}, 401)
+            return
         body = self._read_body()
 
         if path == '/api/restart':
@@ -713,7 +792,13 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 def main():
-    logger.info("[STARTUP] Reconnector API v8 starting...")
+    logger.info("[STARTUP] Reconnector API v9 starting...")
+    print("")
+    print("=" * 60)
+    print(f"  API KEY (put this in the iOS app's settings):")
+    print(f"  {API_KEY}")
+    print("=" * 60)
+    print("")
     # Start background system info refresher FIRST so status endpoint is fast
     threading.Thread(target=refresh_system_info_loop, daemon=True).start()
     # Give the refresher a moment to populate initial values

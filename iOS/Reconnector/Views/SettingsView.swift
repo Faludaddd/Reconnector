@@ -12,12 +12,12 @@ struct SettingsView: View {
         NavigationView {
             Form {
                 // MARK: - Connection
-                Section("Connection") {
+                Section {
                     TextField("IP Address", text: $ipInput)
                         .keyboardType(.decimalPad)
                         .disableAutocorrection(true)
                         .autocapitalization(.none)
-                    SecureField("Auth Token", text: $tokenInput)
+                    SecureField("API Key (from Termux)", text: $tokenInput)
                         .disableAutocorrection(true)
                         .autocapitalization(.none)
                     Toggle("Auto-Connect on Launch", isOn: $appState.autoConnect)
@@ -27,6 +27,11 @@ struct SettingsView: View {
                         appState.saveConnectionSettings()
                         showingSavedAlert = true
                     }
+                } header: {
+                    Text("Connection")
+                } footer: {
+                    Text("API Key is printed in the Termux terminal when the backend starts. Copy it exactly — every request is authenticated.")
+                        .font(.caption)
                 }
 
                 // MARK: - Notifications
@@ -98,7 +103,7 @@ struct SettingsView: View {
                     HStack {
                         Text("Version")
                         Spacer()
-                        Text("1.3.1").foregroundColor(.secondary)
+                        Text("1.4.0").foregroundColor(.secondary)
                     }
                     HStack {
                         Text("Backend")
