@@ -17,16 +17,6 @@ struct SettingsView: View {
                     Button("Save & Reconnect") { appState.ipAddress = ipInput; appState.authToken = tokenInput; appState.saveSettings(); showingSavedAlert = true }
                 }
                 
-                Section("Appearance") {
-                    Picker("Theme", selection: Binding(get: { appState.colorScheme == .light ? "Light" : "Dark" }, set: { appState.colorScheme = $0 == "Light" ? .light : .dark })) {
-                        Text("Dark").tag("Dark"); Text("Light").tag("Light")
-                    }
-                    Toggle("Compact Mode", isOn: $appState.compactMode)
-                    ColorPicker("Accent Color", selection: $appState.accentColor)
-                }
-                .onChange(of: appState.accentColor) { _ in appState.saveSettings() }
-                .onChange(of: appState.colorScheme) { _ in appState.saveSettings() }
-                
                 Section("Watchdog") {
                     if let status = appState.status {
                         Picker("Check Interval", selection: Binding(get: { status.interval }, set: { newValue in Task { try? await APIClient(ipAddress: appState.ipAddress, authToken: appState.authToken).setInterval(minutes: newValue) } })) {
@@ -61,7 +51,7 @@ struct SettingsView: View {
                 Section { NavigationLink { SetupGuideView() } label: { Label("Setup Guide", systemImage: "book.fill") } }
                 
                 Section("About") {
-                    HStack { Text("Version"); Spacer(); Text("1.0.6").foregroundColor(.secondary) }
+                    HStack { Text("Version"); Spacer(); Text("1.0.7").foregroundColor(.secondary) }
                     HStack { Text("Backend"); Spacer(); Text(appState.status != nil ? "Online" : "Offline").foregroundColor(appState.status != nil ? .green : .red) }
                     Button(role: .destructive) { showingResetAlert = true } label: { Label("Reset All Settings", systemImage: "trash") }
                 }

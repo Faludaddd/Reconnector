@@ -13,15 +13,20 @@ class AppState: ObservableObject {
     @Published var lastConnectionTime: Date?
     @Published var connectionError: String?
     @Published var screenshotImage: UIImage?
+    @Published var videoData: Data?
     @Published var crashes: [CrashEntry] = []
     @Published var isPerformingAction: Bool = false
-    @Published var actionProgress: Double = 0
     @Published var actionName: String = ""
+    @Published var actionProgress: Double = 0
     @Published var actionTimeRemaining: Int = 0
+    @Published var watchdogEnabled: Bool = false
+    @Published var optKillBg: Bool = false
+    @Published var optProcessLimit: Bool = false
+    @Published var optNoAnimations: Bool = false
+    @Published var optForceGpu: Bool = false
+    @Published var optNoBluetooth: Bool = false
     
-    @Published var colorScheme: ColorScheme? = .dark
     @Published var accentColor: Color = .blue
-    @Published var compactMode: Bool = false
     @Published var notifyOnDisconnect: Bool = true
     @Published var notifyOnReconnect: Bool = true
     @Published var notifyOnError: Bool = true
@@ -43,9 +48,7 @@ class AppState: ObservableObject {
         let d = UserDefaults.standard
         ipAddress = d.string(forKey: "ipAddress") ?? ""
         authToken = d.string(forKey: "authToken") ?? "reconnector123"
-        colorScheme = d.string(forKey: "colorScheme") == "light" ? .light : .dark
         accentColor = d.colorForKey("accentColor") ?? .blue
-        compactMode = d.bool(forKey: "compactMode")
         notifyOnDisconnect = d.object(forKey: "notifyDisconnect") as? Bool ?? true
         notifyOnReconnect = d.object(forKey: "notifyReconnect") as? Bool ?? true
         notifyOnError = d.object(forKey: "notifyError") as? Bool ?? true
@@ -58,9 +61,7 @@ class AppState: ObservableObject {
         let d = UserDefaults.standard
         d.set(ipAddress, forKey: "ipAddress")
         d.set(authToken, forKey: "authToken")
-        d.set(colorScheme == .light ? "light" : "dark", forKey: "colorScheme")
         d.setColor(accentColor, forKey: "accentColor")
-        d.set(compactMode, forKey: "compactMode")
         d.set(notifyOnDisconnect, forKey: "notifyDisconnect")
         d.set(notifyOnReconnect, forKey: "notifyReconnect")
         d.set(notifyOnError, forKey: "notifyError")
@@ -90,13 +91,12 @@ class AppState: ObservableObject {
     func stopPolling() { pollTimer?.invalidate(); pollTimer = nil; logPollTimer?.invalidate(); logPollTimer = nil }
     func connectWebSocket() { startPolling() }
     
-    // ACTION LOADING SYSTEM
+    // ACTION LOADING
     func startAction(name: String, estimatedSeconds: Int) {
         isPerformingAction = true
         actionName = name
         actionTimeRemaining = estimatedSeconds
         actionProgress = 0
-        
         actionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             self.actionTimeRemaining -= 1
@@ -110,12 +110,15 @@ class AppState: ObservableObject {
         actionTimer = nil
         isPerformingAction = false
         actionProgress = 1
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.actionProgress = 0 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.actionProgress = 0 }
     }
     
     // NOTIFICATIONS
     func requestNotificationPermission() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
+            if granted { print("[NOTIF] Permission granted") }
+            else { print("[NOTIF] Permission denied") }
+        }
     }
     
     func sendNotification(title: String, body: String) {
@@ -124,45 +127,50 @@ class AppState: ObservableObject {
         content.body = body
         content.sound = .default
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error { print("[NOTIF] Failed: \(error)") }
+            else { print("[NOTIF] Sent: \(title)") }
+        }
     }
     
     func sendTestNotification() {
-        sendNotification(title: "Test Notification", body: "If you can see this, notifications are working!")
+        requestNotificationPermission()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.sendNotification(title: "Reconnector Test", body: "Notifications are working!")
+        }
     }
     
-    // API CALLS
+    // STATUS UPDATES
     private func fetchStatusNow() {
         guard !ipAddress.isEmpty, !isPolling else { return }
         isPolling = true
-        let client = APIClient(ipAddress: ipAddress, authToken: authToken)
-        Task {
-            do {
-                let s = try await client.getStatus()
-                let wasConnected = self.isConnected
-                await MainActor.run {
-                    self.status = s
+        let url = URL(string: "http://\(ipAddress):8080/api/status")!
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 8
+        URLSession.shared.dataTask(with: request) { data, _, error in
+            DispatchQueue.main.async {
+                self.isPolling = false
+                if let data = data, let status = try? JSONDecoder().decode(BotStatus.self, from: data) {
+                    let wasConnected = self.isConnected
+                    self.status = status
                     self.lastConnectionTime = Date()
                     self.isConnected = true
                     self.connectionError = nil
-                    self.isPolling = false
-                    // Notifications on state change
-                    if !wasConnected && self.notifyOnReconnect {
-                        self.sendNotification(title: "Reconnected", body: "Backend connection restored.")
-                    }
-                }
-            } catch {
-                let wasConnected = self.isConnected
-                await MainActor.run {
+                    self.watchdogEnabled = status.watchdog_enabled
+                    self.optKillBg = status.optimizations.kill_bg
+                    self.optProcessLimit = status.optimizations.process_limit
+                    self.optNoAnimations = status.optimizations.no_animations
+                    self.optForceGpu = status.optimizations.force_gpu
+                    self.optNoBluetooth = status.optimizations.no_bluetooth
+                    if !wasConnected && self.notifyOnReconnect { self.sendNotification(title: "Reconnected", body: "Backend connection restored.") }
+                } else {
+                    let wasConnected = self.isConnected
                     self.isConnected = false
-                    self.isPolling = false
                     self.connectionError = "Cannot reach backend"
-                    if wasConnected && self.notifyOnDisconnect {
-                        self.sendNotification(title: "Disconnected", body: "Lost connection to backend.")
-                    }
+                    if wasConnected && self.notifyOnDisconnect { self.sendNotification(title: "Disconnected", body: "Lost connection to backend.") }
                 }
             }
-        }
+        }.resume()
     }
     
     private func fetchLogsNow() {
@@ -180,28 +188,82 @@ class AppState: ObservableObject {
     func fetchScreenshot() async {
         guard !ipAddress.isEmpty else { return }
         startAction(name: "Capturing Screenshot", estimatedSeconds: 5)
-        let client = APIClient(ipAddress: ipAddress, authToken: authToken)
-        do {
-            let response = try await client.getScreenshot()
-            if let imageData = Data(base64Encoded: response.image), let image = UIImage(data: imageData) {
-                DispatchQueue.main.async { self.screenshotImage = image; self.endAction() }
-            } else { DispatchQueue.main.async { self.endAction() } }
-        } catch { DispatchQueue.main.async { self.endAction() } }
+        let url = URL(string: "http://\(ipAddress):8080/api/screenshot")!
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            DispatchQueue.main.async {
+                if let data = data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let imgStr = json["image"] as? String, let imgData = Data(base64Encoded: imgStr), let image = UIImage(data: imgData) {
+                    self.screenshotImage = image
+                }
+                self.endAction()
+            }
+        }.resume()
+    }
+    
+    func fetchVideo() async {
+        guard !ipAddress.isEmpty else { return }
+        startAction(name: "Recording 3s Proving Video", estimatedSeconds: 6)
+        let url = URL(string: "http://\(ipAddress):8080/api/video")!
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            DispatchQueue.main.async {
+                if let data = data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let vidStr = json["video"] as? String, let vidData = Data(base64Encoded: vidStr) {
+                    self.videoData = vidData
+                }
+                self.endAction()
+            }
+        }.resume()
     }
     
     func fetchCrashes() async {
         guard !ipAddress.isEmpty else { return }
-        let client = APIClient(ipAddress: ipAddress, authToken: authToken)
-        do {
-            let response = try await client.getCrashes()
+        let url = URL(string: "http://\(ipAddress):8080/api/crashes")!
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            guard let data = data, let response = try? JSONDecoder().decode(CrashResponse.self, from: data) else { return }
             DispatchQueue.main.async { self.crashes = response.crashes }
-        } catch {}
+        }.resume()
+    }
+    
+    func clearLogsServer() {
+        guard !ipAddress.isEmpty else { return }
+        let url = URL(string: "http://\(ipAddress):8080/api/clear-logs")!
+        var request = URLRequest(url: url); request.httpMethod = "GET"
+        URLSession.shared.dataTask(with: request) { _, _, _ in }.resume()
+    }
+    
+    func toggleWatchdog() {
+        // Optimistic update
+        watchdogEnabled.toggle()
+        let url = URL(string: "http://\(ipAddress):8080/api/watchdog/toggle")!
+        var request = URLRequest(url: url); request.httpMethod = "POST"
+        URLSession.shared.dataTask(with: request) { _, _, _ in }.resume()
+    }
+    
+    func toggleOptimization(name: String, current: Bool) {
+        let newValue = !current
+        // Optimistic update
+        switch name {
+        case "kill_bg": optKillBg = newValue
+        case "process_limit": optProcessLimit = newValue
+        case "no_animations": optNoAnimations = newValue
+        case "force_gpu": optForceGpu = newValue
+        case "no_bluetooth": optNoBluetooth = newValue
+        default: break
+        }
+        
+        let url = URL(string: "http://\(ipAddress):8080/api/optimize/\(name)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["enabled": newValue])
+        URLSession.shared.dataTask(with: request) { _, _, _ in }.resume()
     }
     
     func restartRoblox() async {
-        startAction(name: "Restarting Roblox", estimatedSeconds: 15)
-        let client = APIClient(ipAddress: ipAddress, authToken: authToken)
-        do { _ = try await client.restart() } catch { DispatchQueue.main.async { self.endAction() } }
+        startAction(name: "Restarting Roblox", estimatedSeconds: 10)
+        let url = URL(string: "http://\(ipAddress):8080/api/restart")!
+        var request = URLRequest(url: url); request.httpMethod = "POST"
+        URLSession.shared.dataTask(with: request) { _, _, _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { self.endAction() }
+        }.resume()
     }
 }
 

@@ -6,7 +6,6 @@ struct LogsView: View {
     @State private var selectedLevel = "ALL"
     @State private var multiSelectMode = false
     @State private var selectedEntries: Set<UUID> = []
-    @State private var showingExportSheet = false
     
     var filteredLogs: [LogEntry] {
         var result = appState.logs
@@ -29,9 +28,12 @@ struct LogsView: View {
                         Text("INFO").tag("INFO")
                         Text("WARNING").tag("WARNING")
                         Text("ERROR").tag("ERROR")
-                    }.pickerStyle(.segmented).frame(width: 200)
+                    }.pickerStyle(.segmented).frame(width: 250)
                     Spacer()
-                    Button { appState.logs.removeAll() } label: { Image(systemName: "trash") }.disabled(appState.logs.isEmpty)
+                    Button { 
+                        appState.logs.removeAll()
+                        appState.clearLogsServer()
+                    } label: { Image(systemName: "trash") }.disabled(appState.logs.isEmpty)
                     Button { UIPasteboard.general.string = appState.logs.map { $0.text }.joined(separator: "\n") } label: { Image(systemName: "doc.on.doc") }.disabled(appState.logs.isEmpty)
                 }
                 .padding(.horizontal, 12).padding(.vertical, 8)

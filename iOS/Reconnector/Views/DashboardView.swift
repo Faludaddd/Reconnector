@@ -6,18 +6,18 @@ struct DashboardView: View {
     var body: some View {
         NavigationView {
             ScrollView {
-                VStack(spacing: appState.compactMode ? 12 : 20) {
+                VStack(spacing: 20) {
                     if let status = appState.status {
                         // Status Card
-                        VStack(spacing: appState.compactMode ? 8 : 16) {
+                        VStack(spacing: 16) {
                             Image(systemName: statusIcon(for: status.roblox_state))
-                                .font(.system(size: appState.compactMode ? 36 : 48))
+                                .font(.system(size: 48))
                                 .foregroundColor(statusColor(for: status.roblox_state))
                             Text(status.roblox_state.capitalized).font(.title2).fontWeight(.bold)
                             Text(status.roblox_running ? "Roblox is running" : "Roblox is not running").font(.subheadline).foregroundColor(.secondary)
                         }
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, appState.compactMode ? 16 : 32)
+                        .padding(.vertical, 32)
                         .padding(.horizontal, 24)
                         .background(Color(UIColor.secondarySystemBackground))
                         .cornerRadius(20)
@@ -36,7 +36,6 @@ struct DashboardView: View {
                             Divider()
                             InfoRow(label: "Watchdog", value: status.watchdog_enabled ? "Active" : "Off", color: status.watchdog_enabled ? .green : .red)
                             InfoRow(label: "Interval", value: "\(status.interval) min", color: .blue)
-                            InfoRow(label: "Brightness", value: "\(status.brightness)%", color: .yellow)
                             InfoRow(label: "Internet", value: status.internet == true ? "Online" : "Offline", color: status.internet == true ? .green : .red)
                             if let ram = status.ram_total, let free = status.ram_free {
                                 InfoRow(label: "RAM", value: "\(ram - free)MB / \(ram)MB", color: .purple)
@@ -63,13 +62,14 @@ struct DashboardView: View {
                         }
                         .frame(maxWidth: .infinity)
                     }
-                    Text("Reconnector v1.0.6").font(.caption2).foregroundColor(.secondary).padding(.top, 8)
+                    Text("Reconnector v1.0.7").font(.caption2).foregroundColor(.secondary).padding(.top, 8)
                 }
                 .padding(.horizontal, 20)
                 .padding(.top, 8)
                 .padding(.bottom, 40)
             }
             .navigationTitle("Dashboard")
+            .toolbar { Button { Task { await appState.fetchStatus() } } label: { Image(systemName: "arrow.clockwise") } }
             .refreshable { await appState.fetchStatus() }
         }
         .navigationViewStyle(.stack)
@@ -93,6 +93,6 @@ struct StatCard: View {
             Text(title).font(.caption).foregroundColor(.secondary)
         }
         .frame(maxWidth: .infinity, minHeight: 100).padding(16)
-        .background(Color(UIColor.secondarySystemBackground)).cornerRadius(16)
+        .background(Color(UIColor.secondarySystemBackground)).cornerRadius(20)
     }
 }

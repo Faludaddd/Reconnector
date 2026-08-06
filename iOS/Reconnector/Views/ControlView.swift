@@ -4,21 +4,16 @@ struct ControlView: View {
     @EnvironmentObject var appState: AppState
     @State private var showingRestartAlert = false
     @State private var showingScreenshot = false
+    @State private var showingVideo = false
     @State private var showingGameLinkEditor = false
     @State private var gameLinkInput = ""
     
     var body: some View {
         NavigationView {
             ScrollView {
-                VStack(spacing: appState.compactMode ? 12 : 20) {
-                    // Action Loading Overlay
-                    if appState.isPerformingAction {
-                        ActionLoadingCard(name: appState.actionName, progress: appState.actionProgress, remaining: appState.actionTimeRemaining)
-                    }
-                    
+                VStack(spacing: 20) {
                     // Quick Actions
-                    VStack(alignment: .leading, spacing: 16) {
-                        Text("Quick Actions").font(.headline)
+                    ActionCard(title: "Quick Actions") {
                         VStack(spacing: 12) {
                             Button(role: .destructive) { showingRestartAlert = true } label: {
                                 Label("Force Restart Roblox", systemImage: "arrow.clockwise.circle.fill").frame(maxWidth: .infinity)
@@ -28,45 +23,48 @@ struct ControlView: View {
                                 Label("Take Screenshot", systemImage: "camera.fill").frame(maxWidth: .infinity)
                             }.buttonStyle(.bordered).controlSize(.large).disabled(appState.isPerformingAction)
                             
+                            Button { Task { await appState.fetchVideo(); showingVideo = true } } label: {
+                                Label("3s Proving Video", systemImage: "video.fill").frame(maxWidth: .infinity)
+                            }.buttonStyle(.bordered).controlSize(.large).disabled(appState.isPerformingAction)
+                            
                             Button { Task { try? await APIClient(ipAddress: appState.ipAddress, authToken: appState.authToken).clearAntiLoop() } } label: {
                                 Label("Clear Anti-Loop", systemImage: "arrow.uturn.left.circle").frame(maxWidth: .infinity)
                             }.buttonStyle(.bordered).controlSize(.large)
                         }
-                    }.padding(20).background(Color(UIColor.secondarySystemBackground)).cornerRadius(20)
+                    }
                     
                     // Watchdog
-                    VStack(alignment: .leading, spacing: 16) {
-                        Text("Watchdog").font(.headline)
+                    ActionCard(title: "Watchdog") {
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text("Status")
-                                Text(appState.status?.watchdog_enabled == true ? "Active" : "Disabled").foregroundColor(appState.status?.watchdog_enabled == true ? .green : .red).fontWeight(.medium)
+                                Text(appState.watchdogEnabled ? "Active" : "Disabled").foregroundColor(appState.watchdogEnabled ? .green : .red).fontWeight(.medium)
                             }
                             Spacer()
-                            Button("Toggle") { Task { try? await APIClient(ipAddress: appState.ipAddress, authToken: appState.authToken).toggleWatchdog() } }.buttonStyle(.borderedProminent)
+                            Button(appState.watchdogEnabled ? "Disable" : "Enable") { appState.toggleWatchdog() }
+                                .buttonStyle(.borderedProminent)
+                                .tint(appState.watchdogEnabled ? .red : .green)
                         }
-                    }.padding(20).background(Color(UIColor.secondarySystemBackground)).cornerRadius(20)
+                    }
                     
                     // Optimizations
-                    VStack(alignment: .leading, spacing: 16) {
-                        Text("Optimizations").font(.headline).foregroundColor(appState.accentColor)
-                        if let opts = appState.status?.optimizations {
-                            VStack(spacing: 12) {
-                                OptimizationRow(title: "Kill Background Apps", isOn: opts.kill_bg, name: "kill_bg", appState: appState)
-                                OptimizationRow(title: "Process Limit", isOn: opts.process_limit, name: "process_limit", appState: appState)
-                                OptimizationRow(title: "No Animations", isOn: opts.no_animations, name: "no_animations", appState: appState)
-                                OptimizationRow(title: "Force GPU Rendering", isOn: opts.force_gpu, name: "force_gpu", appState: appState)
-                                OptimizationRow(title: "Disable Bluetooth", isOn: opts.no_bluetooth, name: "no_bluetooth", appState: appState)
-                            }
+                    ActionCard(title: "Optimizations") {
+                        VStack(spacing: 12) {
+                            OptToggle(title: "Kill Background Apps", isOn: appState.optKillBg) { appState.toggleOptimization(name: "kill_bg", current: appState.optKillBg) }
+                            OptToggle(title: "Process Limit", isOn: appState.optProcessLimit) { appState.toggleOptimization(name: "process_limit", current: appState.optProcessLimit) }
+                            OptToggle(title: "No Animations", isOn: appState.optNoAnimations) { appState.toggleOptimization(name: "no_animations", current: appState.optNoAnimations) }
+                            OptToggle(title: "Force GPU Rendering", isOn: appState.optForceGpu) { appState.toggleOptimization(name: "force_gpu", current: appState.optForceGpu) }
+                            OptToggle(title: "Disable Bluetooth", isOn: appState.optNoBluetooth) { appState.toggleOptimization(name: "no_bluetooth", current: appState.optNoBluetooth) }
                         }
-                    }.padding(20).background(Color(UIColor.secondarySystemBackground)).cornerRadius(20)
+                    }
                     
                     // Game Link
-                    VStack(alignment: .leading, spacing: 16) {
-                        Text("Game Link").font(.headline)
-                        Text(appState.status?.game_link ?? "Not set").font(.caption).foregroundColor(.secondary).lineLimit(2)
-                        Button("Edit Game Link") { gameLinkInput = appState.status?.game_link ?? ""; showingGameLinkEditor = true }.buttonStyle(.bordered)
-                    }.padding(20).background(Color(UIColor.secondarySystemBackground)).cornerRadius(20)
+                    ActionCard(title: "Game Link") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(appState.status?.game_link ?? "Not set").font(.caption).foregroundColor(.secondary).lineLimit(2)
+                            Button("Edit Game Link") { gameLinkInput = appState.status?.game_link ?? ""; showingGameLinkEditor = true }.buttonStyle(.bordered)
+                        }
+                    }
                 }
                 .padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 40)
             }
@@ -80,6 +78,11 @@ struct ControlView: View {
                 if let image = appState.screenshotImage { Image(uiImage: image).resizable().aspectRatio(contentMode: .fit).padding() }
                 else { ProgressView("Loading...") }
             }
+            .sheet(isPresented: $showingVideo) {
+                if let videoData = appState.videoData {
+                    VideoPlayerView(videoData: videoData)
+                } else { ProgressView("Loading...") }
+            }
             .alert("Edit Game Link", isPresented: $showingGameLinkEditor) {
                 TextField("Game Link", text: $gameLinkInput)
                 Button("Cancel", role: .cancel) {}
@@ -89,35 +92,49 @@ struct ControlView: View {
     }
 }
 
-struct ActionLoadingCard: View {
-    let name: String
-    let progress: Double
-    let remaining: Int
+struct ActionCard<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
     
     var body: some View {
-        VStack(spacing: 12) {
-            HStack {
-                ProgressView(value: progress).progressViewStyle(.circular)
-                VStack(alignment: .leading) {
-                    Text(name).font(.subheadline).fontWeight(.medium)
-                    Text("~\(remaining)s remaining").font(.caption).foregroundColor(.secondary)
-                }
-                Spacer()
-            }
+        VStack(alignment: .leading, spacing: 16) {
+            Text(title).font(.headline)
+            content
         }
-        .padding(16)
-        .background(Color(UIColor.tertiarySystemBackground))
-        .cornerRadius(12)
+        .padding(20)
+        .background(Color(UIColor.secondarySystemBackground))
+        .cornerRadius(20)
     }
 }
 
-struct OptimizationRow: View {
-    let title: String; let isOn: Bool; let name: String; let appState: AppState
+struct OptToggle: View {
+    let title: String
+    let isOn: Bool
+    let action: () -> Void
+    
     var body: some View {
         HStack {
             Text(title).font(.subheadline)
             Spacer()
-            Toggle("", isOn: Binding(get: { isOn }, set: { newValue in Task { try? await APIClient(ipAddress: appState.ipAddress, authToken: appState.authToken).toggleOptimization(name: name, enabled: newValue) } })).labelsHidden()
+            Toggle("", isOn: Binding(get: { isOn }, set: { _ in action() })).labelsHidden()
         }
     }
+}
+
+import AVKit
+import AVFoundation
+
+struct VideoPlayerView: UIViewControllerRepresentable {
+    let videoData: Data
+    
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("proving.mp4")
+        try? videoData.write(to: tempURL)
+        let player = AVPlayer(url: tempURL)
+        let controller = AVPlayerViewController()
+        controller.player = player
+        return controller
+    }
+    
+    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {}
 }
