@@ -7,6 +7,12 @@ struct DashboardView: View {
         NavigationView {
             ScrollView {
                 VStack(spacing: AppTheme.sectionSpacing) {
+                    // Always-visible connection banner — shows the actual communication state
+                    ConnectionBanner(isConnected: appState.isConnected,
+                                     isConnecting: appState.isConnecting,
+                                     lastSeen: appState.lastConnectionTime,
+                                     error: appState.connectionError)
+
                     if let status = appState.status {
                         // Status hero card
                         AppCard {
@@ -93,7 +99,7 @@ struct DashboardView: View {
                             .padding(.vertical, 24)
                         }
                     }
-                    Text("Reconnector v1.2.0")
+                    Text("Reconnector v1.3.0")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
@@ -152,6 +158,67 @@ struct StatCard: View {
         }
         .frame(maxWidth: .infinity, minHeight: 96)
         .padding(14)
+        .background(AppTheme.cardBackground)
+        .cornerRadius(AppTheme.cornerRadius)
+    }
+}
+
+// MARK: - Connection Banner
+// Shows the actual backend communication state at the top of the Dashboard.
+// Green = connected, Yellow = connecting, Red = disconnected.
+struct ConnectionBanner: View {
+    let isConnected: Bool
+    let isConnecting: Bool
+    let lastSeen: Date?
+    let error: String?
+
+    private var color: Color {
+        if isConnected { return .green }
+        if isConnecting { return .yellow }
+        return .red
+    }
+
+    private var label: String {
+        if isConnected { return "Connected" }
+        if isConnecting { return "Connecting…" }
+        return "Disconnected"
+    }
+
+    private var detail: String {
+        if isConnected {
+            if let last = lastSeen {
+                return "Last update \(last, style: .relative) ago"
+            }
+            return "Live"
+        }
+        return error ?? "—"
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Circle()
+                .fill(color)
+                .frame(width: 10, height: 10)
+                .overlay(
+                    Circle()
+                        .stroke(color.opacity(0.3), lineWidth: 6)
+                        .scaleEffect(isConnecting ? 1.4 : 1.0)
+                        .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true),
+                                   value: isConnecting)
+                )
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                Text(detail)
+                    .font(AppTheme.captionFont)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
         .background(AppTheme.cardBackground)
         .cornerRadius(AppTheme.cornerRadius)
     }

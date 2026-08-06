@@ -1,10 +1,10 @@
 """
-Reconnector API Server v7
-- Smart multi-signal watchdog (PID + activity state + Lua signal + cooldown)
-- Single-attempt reconnect with internal retries (cleaner log + UI)
-- 3-second video (renamed from "proving")
-- All endpoints echo state for client confirmation
+Reconnector API Server v8
+- Single intelligent recovery flow (no multi-attempt logs)
+- Smart watchdog state machine (no false positives during launches)
+- Background-cached system info (battery/internet/temp/uptime) — status endpoint <100ms
 - Stable log clearing
+- All endpoints echo state for client confirmation
 """
 import os, time, subprocess, json, re, logging, sys, base64, threading
 from datetime import datetime
@@ -19,11 +19,13 @@ DISCONNECT_SIGNAL_FILE = "/sdcard/AE_disconnect_signal.txt"
 HOST = "0.0.0.0"
 PORT = 8080
 DEFAULT_TIMEOUT = 15
-POST_RECONNECT_COOLDOWN_SEC = 90
-# Give Roblox this many seconds of "launching" grace before declaring it dead.
-LAUNCH_GRACE_SEC = 45
-# Consider Roblox healthy if it has been alive this long without crashing.
-HEALTHY_SETTLE_SEC = 30
+
+# How long after a reconnect before we trust Roblox is healthy.
+POST_RECONNECT_GRACE_SEC = 60
+# How long after we last saw a PID before declaring Roblox dead.
+DEATH_CONFIRMATION_SEC = 20
+# Background refresh interval for slow system queries.
+SYS_REFRESH_INTERVAL_SEC = 15
 
 DISCONNECT_KEYWORDS = [
     "disconnected", "reconnect unsuccessful", "lost connection",
@@ -53,9 +55,9 @@ class State:
     watchdog_interval_minutes = 1
     last_crash_reason = "-"
     bot_first_start_time = time.time()
-    roblox_state = "unknown"  # unknown | healthy | loading | reconnecting | offline
+    # State machine: unknown | launching | healthy | reconnecting | offline
+    roblox_state = "unknown"
     last_reconnect_time = 0
-    last_state_change_time = time.time()
     consecutive_ocr_hits = 0
     stats = {"crashes": 0, "kicks": 0, "network_drops": 0}
     reconnect_timestamps = []
@@ -65,16 +67,25 @@ class State:
     opt_no_animations = False
     opt_force_gpu = False
     opt_no_bluetooth = False
-    brightness = 128
-    # Multi-signal health tracker
+
+    # Watchdog tracking
     last_pid_seen_time = 0
-    last_activity_alive_time = 0
     last_lua_signal_time = 0
+    recovery_in_progress = False
+
+    # Cached system info (refreshed by background thread)
+    cached_battery = -1
+    cached_internet = False
+    cached_cpu_temp = None
+    cached_ram_total = None
+    cached_ram_free = None
+    cached_uptime = 0
+    cached_brightness = 128
 
 
 state = State()
 reconnect_lock = threading.Lock()
-_health_lock = threading.Lock()
+_state_lock = threading.Lock()
 
 
 def _run_cmd(cmd, timeout=DEFAULT_TIMEOUT):
@@ -83,33 +94,6 @@ def _run_cmd(cmd, timeout=DEFAULT_TIMEOUT):
         return result.stdout.strip()
     except Exception:
         return ""
-
-
-def get_battery():
-    try:
-        r = subprocess.run(['rish', '-c', 'dumpsys battery | grep level'],
-                           capture_output=True, text=True, timeout=5)
-        for l in r.stdout.splitlines():
-            if l.strip().startswith("level:"):
-                try:
-                    return int(l.split(":")[1].strip())
-                except Exception:
-                    return -1
-        return -1
-    except Exception:
-        return -1
-
-
-def get_brightness():
-    try:
-        r = subprocess.run(['rish', '-c', 'settings get system screen_brightness'],
-                           capture_output=True, text=True, timeout=3)
-        val = r.stdout.strip()
-        if val.isdigit():
-            return int(val)
-    except Exception:
-        pass
-    return state.brightness
 
 
 def get_roblox_pid():
@@ -137,20 +121,17 @@ def is_process_alive(pid_str):
 
 
 def get_roblox_activity_state():
-    """Returns one of: 'foreground', 'background', 'stopped', 'unknown'.
-    Uses ActivityManager to figure out what Roblox is actually doing —
-    more reliable than PID alone during launches."""
+    """Returns: 'foreground' | 'background' | 'stopped' | 'unknown'."""
     try:
         r = subprocess.run(
             ['rish', '-c',
-             f'dumpsys activity activities | grep -E "mResumedActivity|topResumedActivity|mFocusedActivity" | head -3'],
+             f'dumpsys activity activities 2>/dev/null | grep -E "mResumedActivity|topResumedActivity|mFocusedActivity" | head -3'],
             capture_output=True, text=True, timeout=5)
         out = r.stdout.lower()
         if PACKAGE in out:
             return "foreground"
-        # Check if Roblox is at least running in any form
         r2 = subprocess.run(
-            ['rish', '-c', f'dumpsys activity processes | grep -c "ProcessRecord.*{PACKAGE}"'],
+            ['rish', '-c', f'dumpsys activity processes 2>/dev/null | grep -c "ProcessRecord.*{PACKAGE}"'],
             capture_output=True, text=True, timeout=5)
         if r2.stdout.strip() not in ("", "0"):
             return "background"
@@ -159,42 +140,81 @@ def get_roblox_activity_state():
         return "unknown"
 
 
-def has_internet():
-    try:
-        r = subprocess.run(['rish', '-c', 'ping -c 1 -W 3 8.8.8.8'],
-                           capture_output=True, text=True, timeout=6)
-        return r.returncode == 0
-    except Exception:
-        return False
+# ---------------------------------------------------------------------------
+# BACKGROUND SYSTEM INFO REFRESHER
+# ---------------------------------------------------------------------------
+def refresh_system_info_loop():
+    """Refreshes slow system queries (battery, internet, temp, etc.) in background
+    so the /api/status endpoint stays fast (<100ms)."""
+    logger.info("[STARTUP] System info refresher started")
+    while True:
+        try:
+            # Battery
+            try:
+                r = subprocess.run(['rish', '-c', 'dumpsys battery | grep level'],
+                                   capture_output=True, text=True, timeout=5)
+                for l in r.stdout.splitlines():
+                    if l.strip().startswith("level:"):
+                        try:
+                            state.cached_battery = int(l.split(":")[1].strip())
+                        except Exception:
+                            pass
+                        break
+            except Exception:
+                pass
 
+            # Internet
+            try:
+                r = subprocess.run(['rish', '-c', 'ping -c 1 -W 3 8.8.8.8'],
+                                   capture_output=True, text=True, timeout=6)
+                state.cached_internet = (r.returncode == 0)
+            except Exception:
+                state.cached_internet = False
 
-def get_system_info():
-    info = {"cpu_temp": None, "ram_total": None, "ram_free": None, "uptime": None}
-    try:
-        r = subprocess.run(['rish', '-c', 'cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null'],
-                           capture_output=True, text=True, timeout=3)
-        if r.stdout.strip():
-            info["cpu_temp"] = int(r.stdout.strip()) / 1000.0
-    except Exception:
-        pass
-    try:
-        r = subprocess.run(['rish', '-c', 'cat /proc/meminfo | head -3'],
-                           capture_output=True, text=True, timeout=3)
-        for l in r.stdout.splitlines():
-            if "MemTotal" in l:
-                info["ram_total"] = int(l.split()[1]) // 1024
-            elif "MemFree" in l:
-                info["ram_free"] = int(l.split()[1]) // 1024
-    except Exception:
-        pass
-    try:
-        r = subprocess.run(['rish', '-c', 'cat /proc/uptime'],
-                           capture_output=True, text=True, timeout=3)
-        if r.stdout.strip():
-            info["uptime"] = int(float(r.stdout.split()[0]))
-    except Exception:
-        pass
-    return info
+            # CPU temp
+            try:
+                r = subprocess.run(['rish', '-c', 'cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null'],
+                                   capture_output=True, text=True, timeout=3)
+                if r.stdout.strip():
+                    state.cached_cpu_temp = int(r.stdout.strip()) / 1000.0
+            except Exception:
+                pass
+
+            # RAM
+            try:
+                r = subprocess.run(['rish', '-c', 'cat /proc/meminfo | head -3'],
+                                   capture_output=True, text=True, timeout=3)
+                for l in r.stdout.splitlines():
+                    if "MemTotal" in l:
+                        state.cached_ram_total = int(l.split()[1]) // 1024
+                    elif "MemFree" in l:
+                        state.cached_ram_free = int(l.split()[1]) // 1024
+            except Exception:
+                pass
+
+            # Uptime
+            try:
+                r = subprocess.run(['rish', '-c', 'cat /proc/uptime'],
+                                   capture_output=True, text=True, timeout=3)
+                if r.stdout.strip():
+                    state.cached_uptime = int(float(r.stdout.split()[0]))
+            except Exception:
+                pass
+
+            # Brightness
+            try:
+                r = subprocess.run(['rish', '-c', 'settings get system screen_brightness'],
+                                   capture_output=True, text=True, timeout=3)
+                val = r.stdout.strip()
+                if val.isdigit():
+                    state.cached_brightness = int(val)
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.error(f"[SYSREFRESH] Error: {e}")
+
+        time.sleep(SYS_REFRESH_INTERVAL_SEC)
 
 
 def capture_and_check_disconnect():
@@ -241,17 +261,22 @@ def apply_optimization(name, enabled):
 
 
 # ---------------------------------------------------------------------------
-# RECONNECT — single clean attempt with internal retries.
-# User-facing status changes only happen twice: reconnecting -> (healthy|offline).
-# Internal attempts are logged but not surfaced as separate UI states.
+# SINGLE INTELLIGENT RECOVERY FLOW
+# No multi-attempt logs. One workflow. Only meaningful events are logged.
 # ---------------------------------------------------------------------------
 def reconnect_game(reason="unknown"):
     with reconnect_lock:
+        # Prevent overlapping recovery attempts
+        if state.recovery_in_progress:
+            logger.info("[RECONNECT] Already in progress, skipping")
+            return False
+        # Skip if we just reconnected (within 45s)
         recent = [t for t in state.reconnect_timestamps if time.time() - t < 45]
         if recent:
-            logger.info("[RECONNECTOR] Skipping — already in progress")
+            logger.info("[RECONNECT] Recent reconnect, skipping")
             return False
 
+        state.recovery_in_progress = True
         state.reconnect_timestamps.append(time.time())
         state.stats["crashes"] += 1
         state.last_crash_reason = reason
@@ -260,74 +285,68 @@ def reconnect_game(reason="unknown"):
         if len(state.crash_log) > 50:
             state.crash_log = state.crash_log[:50]
 
-        logger.info(f"[RECONNECTOR] Trigger: {reason}")
+        logger.info(f"[RECONNECT] Reconnect started. Reason: {reason}")
         m = re.search(r'/games/(\d+)', state.current_game_link)
         launch_url = f"roblox://placeId={m.group(1)}" if m else state.current_game_link
 
-        # Single user-visible attempt; up to 3 internal retries
-        relaunched = False
-        internal_delays = [0, 6, 10]
-        for i, delay in enumerate(internal_delays):
-            if delay > 0:
-                logger.info(f"[RECONNECTOR] Internal retry {i + 1} after {delay}s")
-                time.sleep(delay)
-            else:
-                logger.info(f"[RECONNECTOR] Starting recovery")
-
-            # Force-stop
-            _run_cmd(f'am force-stop {PACKAGE}')
-            time.sleep(1.2)
-
-            # Kill leftover PID
-            pid = get_roblox_pid()
-            if pid:
-                _run_cmd(f'kill -9 {pid.split()[0]}')
-                time.sleep(0.8)
-
-            # Deep-link launch
-            _run_cmd(f'am start -a android.intent.action.VIEW -d "{launch_url}"')
-
-            # Wait for process with smart multi-signal polling
-            deadline = time.time() + 25
-            time.sleep(3)
-            while time.time() < deadline:
-                new_pid = get_roblox_pid()
-                if new_pid and is_process_alive(new_pid):
-                    # Confirm via activity manager that Roblox actually came up
-                    act_state = get_roblox_activity_state()
-                    if act_state in ("foreground", "background"):
-                        relaunched = True
-                        logger.info(f"[RECONNECTOR] Roblox live (PID {new_pid.split()[0]}, activity={act_state})")
-                        break
-                time.sleep(1.5)
-
-            if relaunched:
-                break
+        success = _perform_recovery(launch_url)
 
         state.consecutive_ocr_hits = 0
         state.last_reconnect_time = time.time()
-        if relaunched:
-            _set_state("loading")
-            logger.info("[RECONNECTOR] Recovery complete — Roblox launching")
+        state.recovery_in_progress = False
+
+        if success:
+            _set_state("launching")
+            logger.info("[RECONNECT] Reconnect complete. Roblox detected.")
         else:
             _set_state("offline")
-            logger.error("[RECONNECTOR] Recovery failed — Roblox offline")
-        return relaunched
+            logger.error("[RECONNECT] Reconnect failed.")
+        return success
+
+
+def _perform_recovery(launch_url):
+    """Single recovery workflow. Internal validation only — no attempt-counter logs."""
+    # 1. Force-stop
+    logger.info("[RECONNECT] Force-stopping Roblox.")
+    _run_cmd(f'am force-stop {PACKAGE}')
+    time.sleep(1.5)
+
+    # 2. Kill any leftover PID
+    pid = get_roblox_pid()
+    if pid:
+        _run_cmd(f'kill -9 {pid.split()[0]}')
+        time.sleep(1)
+
+    # 3. Launch via deep link
+    logger.info("[RECONNECT] Launching Roblox.")
+    _run_cmd(f'am start -a android.intent.action.VIEW -d "{launch_url}"')
+
+    # 4. Wait for Roblox to come up — smart polling with multi-signal validation
+    logger.info("[RECONNECT] Waiting for Roblox to launch.")
+    deadline = time.time() + 35
+    time.sleep(3)  # initial settle
+    while time.time() < deadline:
+        new_pid = get_roblox_pid()
+        if new_pid and is_process_alive(new_pid):
+            # Confirm via activity manager — Roblox must actually be a real process
+            act_state = get_roblox_activity_state()
+            if act_state in ("foreground", "background"):
+                return True
+        time.sleep(2)
+
+    return False
 
 
 def _set_state(new_state):
-    """Update roblox_state and track when it changed."""
-    with _health_lock:
+    with _state_lock:
         if state.roblox_state != new_state:
             state.roblox_state = new_state
-            state.last_state_change_time = time.time()
 
 
 # ---------------------------------------------------------------------------
 # 3-SECOND VIDEO
 # ---------------------------------------------------------------------------
 def record_3s_video():
-    """Records a 3-second screen recording and returns base64 MP4."""
     video_path = "/sdcard/rbx_3s_video.mp4"
     _run_cmd(f'rm -f {video_path}')
     logger.info("[VIDEO] Recording 3-second video...")
@@ -386,11 +405,22 @@ def clear_logs():
 
 
 # ---------------------------------------------------------------------------
-# SMART WATCHDOG — uses multiple signals before triggering reconnect
+# SMART WATCHDOG — STATE MACHINE
+# Distinguishes: launching | healthy | transitioning | closing | crashed
 # ---------------------------------------------------------------------------
 def evaluate_roblox_health():
-    """Returns (healthy: bool, reason: str). Multi-signal evaluation."""
-    # Signal 1: Lua disconnect file (highest priority — instant signal from inside Roblox)
+    """Returns (action_needed: bool, reason: str).
+
+    State machine logic:
+    - Lua signal → immediate recovery
+    - In post-reconnect grace → healthy
+    - Recovery in progress → skip
+    - Both PID + activity alive → check OCR for disconnect text
+    - PID alive but activity stopped → transitioning, wait
+    - No PID for >20s and activity stopped → recovery needed
+    - Brief PID miss during launch → skip
+    """
+    # Signal 1: Lua disconnect file (highest priority)
     try:
         if os.path.exists(DISCONNECT_SIGNAL_FILE):
             with open(DISCONNECT_SIGNAL_FILE, 'r') as f:
@@ -398,71 +428,72 @@ def evaluate_roblox_health():
             os.remove(DISCONNECT_SIGNAL_FILE)
             state.last_lua_signal_time = time.time()
             logger.warning(f"[WATCHDOG] Lua disconnect signal: {signal[:80]}")
-            return False, "lua_disconnect_signal"
+            return True, "lua_disconnect_signal"
     except Exception:
         pass
 
-    # If we just reconnected, give a long grace period before checking anything else
-    if state.last_reconnect_time > 0 and time.time() - state.last_reconnect_time < POST_RECONNECT_COOLDOWN_SEC:
-        return True, "cooldown"
+    # If recovery is in progress, do nothing
+    if state.recovery_in_progress:
+        return False, "recovery_in_progress"
 
-    # If currently reconnecting, don't double-fire
-    if state.roblox_state == "reconnecting":
-        return True, "reconnecting_in_progress"
+    # In post-reconnect grace — give Roblox time to settle
+    if state.last_reconnect_time > 0 and time.time() - state.last_reconnect_time < POST_RECONNECT_GRACE_SEC:
+        return False, "in_grace"
 
-    # Signal 2: PID exists and is alive
+    # Gather signals
     pid = get_roblox_pid()
     pid_alive = bool(pid) and is_process_alive(pid)
     if pid_alive:
         state.last_pid_seen_time = time.time()
 
-    # Signal 3: Activity manager knows about Roblox
     activity_state = get_roblox_activity_state()
-    if activity_state in ("foreground", "background"):
-        state.last_activity_alive_time = time.time()
 
-    # If we're in the launch grace window, be lenient
-    in_grace = (time.time() - state.last_state_change_time) < LAUNCH_GRACE_SEC
-
+    # CASE A: Roblox is fully alive (PID + activity both agree)
     if pid_alive and activity_state in ("foreground", "background"):
-        # Both signals agree — healthy. Run OCR disconnect check.
-        if capture_and_check_disconnect():
-            state.consecutive_ocr_hits += 1
-            logger.warning(f"[WATCHDOG] Disconnect text detected (consecutive: {state.consecutive_ocr_hits})")
-            if state.consecutive_ocr_hits >= 2:
-                state.stats["kicks"] += 1
+        # OCR disconnect check only if in foreground
+        if activity_state == "foreground":
+            if capture_and_check_disconnect():
+                state.consecutive_ocr_hits += 1
+                logger.warning(f"[WATCHDOG] Disconnect text (consecutive: {state.consecutive_ocr_hits})")
+                if state.consecutive_ocr_hits >= 2:
+                    state.stats["kicks"] += 1
+                    state.consecutive_ocr_hits = 0
+                    return True, "ocr_disconnect"
+            else:
                 state.consecutive_ocr_hits = 0
-                return False, "ocr_disconnect"
-        else:
-            state.consecutive_ocr_hits = 0
         _set_state("healthy")
-        return True, "healthy"
+        return False, "healthy"
 
-    if in_grace:
-        # Within launch grace — don't trigger reconnect yet
-        logger.info(f"[WATCHDOG] In launch grace (pid_alive={pid_alive}, activity={activity_state})")
-        return True, "in_grace"
+    # CASE B: Roblox is in a transitional state (PID alive but activity stopped, or vice versa)
+    # This happens during launches, backgrounding, etc. — DON'T trigger recovery.
+    if pid_alive or activity_state != "stopped":
+        time_since_pid = time.time() - state.last_pid_seen_time if state.last_pid_seen_time > 0 else 0
+        if time_since_pid < DEATH_CONFIRMATION_SEC:
+            logger.info(f"[WATCHDOG] Transitional state (pid={pid_alive}, act={activity_state}) — waiting")
+            return False, "transitioning"
+        # If we haven't seen a PID in a while and activity is also stopped, recovery is needed
+        if not pid_alive and activity_state == "stopped" and time_since_pid >= DEATH_CONFIRMATION_SEC:
+            logger.warning(f"[WATCHDOG] Roblox closed (no PID for {int(time_since_pid)}s, no activity)")
+            return True, "process_closed"
+    else:
+        # CASE C: No PID and activity is stopped — but only recover if we've been dead long enough
+        time_since_pid = time.time() - state.last_pid_seen_time if state.last_pid_seen_time > 0 else 999
+        if time_since_pid >= DEATH_CONFIRMATION_SEC:
+            logger.warning(f"[WATCHDOG] Roblox closed (no PID for {int(time_since_pid)}s)")
+            return True, "process_closed"
 
-    if not pid_alive and activity_state == "stopped":
-        # Both signals agree Roblox is gone
-        if time.time() - state.last_pid_seen_time > 15:
-            logger.warning("[WATCHDOG] Roblox fully stopped (no PID, no activity)")
-            return False, "process_gone"
-
-    # Conflicting signals — wait it out
-    logger.info(f"[WATCHDOG] Conflicting signals (pid_alive={pid_alive}, activity={activity_state}) — waiting")
-    return True, "conflicting_signals"
+    return False, "unknown_healthy"
 
 
 def watchdog_loop():
-    logger.info("[STARTUP] Watchdog started (smart multi-signal)")
+    logger.info("[STARTUP] Watchdog started (smart state machine)")
     while True:
         time.sleep(state.watchdog_interval_minutes * 60)
         if not state.watchdog_enabled:
             continue
         try:
-            healthy, reason = evaluate_roblox_health()
-            if not healthy:
+            action_needed, reason = evaluate_roblox_health()
+            if action_needed:
                 reconnect_game(reason=reason)
         except Exception as e:
             logger.error(f"[WATCHDOG] Error: {e}")
@@ -475,12 +506,12 @@ def fast_disconnect_checker():
         time.sleep(5)
         if not state.watchdog_enabled:
             continue
-        if state.roblox_state == "reconnecting":
+        if state.recovery_in_progress:
             continue
-        if state.last_reconnect_time > 0 and time.time() - state.last_reconnect_time < POST_RECONNECT_COOLDOWN_SEC:
+        if state.last_reconnect_time > 0 and time.time() - state.last_reconnect_time < POST_RECONNECT_GRACE_SEC:
             continue
         try:
-            # Only react to Lua signal + OCR here — leave PID checks to the main watchdog
+            # Lua signal
             if os.path.exists(DISCONNECT_SIGNAL_FILE):
                 with open(DISCONNECT_SIGNAL_FILE, 'r') as f:
                     signal = f.read().strip()
@@ -490,12 +521,13 @@ def fast_disconnect_checker():
                 reconnect_game(reason="lua_disconnect_signal")
                 continue
 
-            # If Roblox is in foreground, run OCR check
+            # Only run OCR if Roblox is in foreground
             pid = get_roblox_pid()
-            if not pid:
+            if not pid or not is_process_alive(pid):
                 continue
-            if not is_process_alive(pid):
+            if get_roblox_activity_state() != "foreground":
                 continue
+
             if capture_and_check_disconnect():
                 state.consecutive_ocr_hits += 1
                 if state.consecutive_ocr_hits >= 2:
@@ -510,26 +542,24 @@ def fast_disconnect_checker():
 
 
 # ---------------------------------------------------------------------------
-# STATUS CACHE
+# STATUS — now FAST because all slow queries are cached
 # ---------------------------------------------------------------------------
 _cache = {"data": None, "ts": 0}
 
 
 def get_status_dict():
     now = time.time()
-    if _cache["data"] and (now - _cache["ts"]) < 3:
+    if _cache["data"] and (now - _cache["ts"]) < 2:
         return _cache["data"]
-    sys_info = get_system_info()
-    state.brightness = get_brightness()
     data = {
         "roblox_state": state.roblox_state,
         "roblox_running": bool(get_roblox_pid()),
-        "battery": get_battery(),
-        "cpu_temp": sys_info.get("cpu_temp"),
-        "ram_total": sys_info.get("ram_total"),
-        "ram_free": sys_info.get("ram_free"),
-        "uptime": sys_info.get("uptime"),
-        "internet": has_internet(),
+        "battery": state.cached_battery,
+        "cpu_temp": state.cached_cpu_temp,
+        "ram_total": state.cached_ram_total,
+        "ram_free": state.cached_ram_free,
+        "uptime": state.cached_uptime,
+        "internet": state.cached_internet,
         "crashes_today": state.stats["crashes"],
         "kicks_today": state.stats["kicks"],
         "network_drops": state.stats["network_drops"],
@@ -537,7 +567,7 @@ def get_status_dict():
         "is_paused": state.is_paused,
         "interval": state.watchdog_interval_minutes,
         "game_link": state.current_game_link,
-        "brightness": state.brightness,
+        "brightness": state.cached_brightness,
         "last_crash_reason": state.last_crash_reason,
         "last_reconnect": int(state.last_reconnect_time) if state.last_reconnect_time else 0,
         "bot_uptime": int(now - state.bot_first_start_time),
@@ -623,7 +653,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         if path == '/api/restart':
             threading.Thread(target=reconnect_game, args=("manual_restart",), daemon=True).start()
-            self._send_json({"status": "initiated", "estimated_seconds": 15})
+            self._send_json({"status": "initiated", "estimated_seconds": 20})
         elif path == '/api/watchdog/toggle':
             state.watchdog_enabled = not state.watchdog_enabled
             logger.info(f"[WATCHDOG] Toggled -> {'ON' if state.watchdog_enabled else 'OFF'}")
@@ -683,7 +713,11 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 def main():
-    logger.info("[STARTUP] Reconnector API v7 starting...")
+    logger.info("[STARTUP] Reconnector API v8 starting...")
+    # Start background system info refresher FIRST so status endpoint is fast
+    threading.Thread(target=refresh_system_info_loop, daemon=True).start()
+    # Give the refresher a moment to populate initial values
+    time.sleep(2)
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=fast_disconnect_checker, daemon=True).start()
     server = ThreadedHTTPServer((HOST, PORT), RequestHandler)

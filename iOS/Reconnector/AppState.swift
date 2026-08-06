@@ -212,7 +212,9 @@ class AppState: ObservableObject {
         }
     }
 
-    // MARK: - Centralized "mark connected" — any successful API call flips this on
+    // MARK: - Centralized "mark connected" — any 2xx HTTP response flips this on
+    // This is the source of truth: if the backend answered with 2xx, we are connected.
+    // Body parsing failures do NOT count as connection failures.
     private func markConnected() {
         let wasConnected = self.isConnected
         self.isConnected = true
@@ -231,13 +233,29 @@ class AppState: ObservableObject {
         guard !ipAddress.isEmpty else { return }
         let url = URL(string: "http://\(ipAddress):8080/api/status")!
         var request = URLRequest(url: url)
-        request.timeoutInterval = 8
-        URLSession.shared.dataTask(with: request) { data, _, error in
+        request.timeoutInterval = 12  // backend is fast now (<100ms) but allow headroom
+        URLSession.shared.dataTask(with: request) { data, response, error in
             DispatchQueue.main.async {
                 self.isConnecting = false
-                if let data = data,
-                   let status = try? JSONDecoder().decode(BotStatus.self, from: data) {
-                    self.handleStatusSuccess(status)
+                // Source of truth: HTTP status code. 2xx = connected.
+                let http = response as? HTTPURLResponse
+                let isReachable = http != nil && (http!.statusCode >= 200 && http!.statusCode < 300)
+
+                if isReachable {
+                    // Backend is reachable — mark connected BEFORE parsing body
+                    self.markConnected()
+                    // Now try to parse body. If parse fails, keep previous status.
+                    if let data = data,
+                       let status = try? JSONDecoder().decode(BotStatus.self, from: data) {
+                        self.applyStatus(status)
+                    }
+                } else if error != nil {
+                    // Real network failure (timeout, connection refused, etc.)
+                    self.handleStatusFailure(error)
+                } else if let code = http?.statusCode {
+                    // Got a response but it's a 4xx/5xx — treat as failure
+                    self.connectionError = "Backend error (HTTP \(code))"
+                    self.handleStatusFailure(nil)
                 } else {
                     self.handleStatusFailure(error)
                 }
@@ -245,8 +263,7 @@ class AppState: ObservableObject {
         }.resume()
     }
 
-    private func handleStatusSuccess(_ status: BotStatus) {
-        markConnected()
+    private func applyStatus(_ status: BotStatus) {
         self.status = status
         self.watchdogEnabled = status.watchdog_enabled
         self.watchdogInterval = status.interval
@@ -296,18 +313,21 @@ class AppState: ObservableObject {
         guard !ipAddress.isEmpty else { return }
         let url = URL(string: "http://\(ipAddress):8080/api/logs")!
         var request = URLRequest(url: url)
-        request.timeoutInterval = 5
-        URLSession.shared.dataTask(with: request) { data, _, _ in
-            guard let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let logLines = json["logs"] as? [String] else { return }
-            // Any successful API response means we ARE connected.
+        request.timeoutInterval = 8
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            // Source of truth: HTTP 2xx = connected
+            let http = response as? HTTPURLResponse
+            let isReachable = http != nil && (http!.statusCode >= 200 && http!.statusCode < 300)
+            guard isReachable, let data = data else { return }
             DispatchQueue.main.async {
                 self.markConnected()
-                if logLines.isEmpty {
-                    self.logs = []
-                } else {
-                    self.logs = logLines.map { LogEntry(text: $0, timestamp: Date()) }
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let logLines = json["logs"] as? [String] {
+                    if logLines.isEmpty {
+                        self.logs = []
+                    } else {
+                        self.logs = logLines.map { LogEntry(text: $0, timestamp: Date()) }
+                    }
                 }
             }
         }.resume()
