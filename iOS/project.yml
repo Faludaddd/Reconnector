@@ -34,28 +34,26 @@ targets:
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
         INFOPLIST_KEY_UIBackgroundModes: "remote-notification fetch"
-        INFOPLIST_KEY_CFBundleDisplayName: "Reconnector"
         CODE_SIGN_IDENTITY: ""
         CODE_SIGNING_REQUIRED: NO
         CODE_SIGNING_ALLOWED: NO
-    preBuildScripts:
+    postBuildScripts:
       - name: Stamp Unique Display Name
-        # Injects version + build + timestamp into Info.plist so every IPA
-        # has a unique home-screen name. Prevents iOS "(1)" duplicates
-        # when sideloading multiple builds.
+        # Runs AFTER Info.plist is copied into the .app bundle.
+        # Injects version + build + timestamp so every IPA has a unique
+        # home-screen name — prevents iOS "(1)" duplicates when sideloading.
         script: |
           set -e
-          PLIST="${BUILT_PRODUCTS_DIR}/${INFOPLIST_PATH}"
+          APP_PATH="${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app"
+          PLIST="${APP_PATH}/Info.plist"
           if [ ! -f "$PLIST" ]; then
-            echo "[stamp-name] Info.plist not yet generated, skipping."
-            exit 0
+            echo "[stamp-name] ERROR: Info.plist not found at $PLIST"
+            exit 1
           fi
-          VERSION="$MARKETING_VERSION"
-          BUILD="$CURRENT_PROJECT_VERSION"
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST")
+          BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$PLIST")
           STAMP=$(date +%y%m%d-%H%M)
           DISPLAY="Reconnector ${VERSION} (${BUILD}) ${STAMP}"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName ${DISPLAY}" "$PLIST" 2>/dev/null || \
-            /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string ${DISPLAY}" "$PLIST"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleName ${DISPLAY}" "$PLIST" 2>/dev/null || \
-            /usr/libexec/PlistBuddy -c "Add :CFBundleName string ${DISPLAY}" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName ${DISPLAY}" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName ${DISPLAY}" "$PLIST"
           echo "[stamp-name] Display name set to: ${DISPLAY}"
