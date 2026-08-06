@@ -93,7 +93,7 @@ struct DashboardView: View {
                             .padding(.vertical, 24)
                         }
                     }
-                    Text("Reconnector v1.1.0")
+                    Text("Reconnector v1.2.0")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }

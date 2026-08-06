@@ -11,7 +11,6 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        // Show banner + sound + badge even when app is in foreground
         completionHandler([.banner, .sound, .badge, .list])
     }
 }
@@ -51,7 +50,7 @@ class AppState: ObservableObject {
     @Published var watchdogEnabled: Bool = false
     @Published var watchdogInterval: Int = 1
 
-    // Optimizations - kept locally so UI toggles instantly
+    // Optimizations
     @Published var optKillBg: Bool = false
     @Published var optProcessLimit: Bool = false
     @Published var optNoAnimations: Bool = false
@@ -84,6 +83,13 @@ class AppState: ObservableObject {
     private var actionTimer: Timer?
     private var consecutiveFailures = 0
     private var lastNotificationState: Bool? = nil
+    // Track whether the user is actively toggling an optimization so
+    // the polling cycle doesn't clobber the optimistic UI state.
+    private var pendingOptimizationToggles: Set<String> = []
+    private var lastForegroundTime: Date = Date()
+
+    // How many consecutive failed polls before we declare disconnected.
+    private let DISCONNECT_THRESHOLD = 3
 
     init() {
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
@@ -92,9 +98,27 @@ class AppState: ObservableObject {
                 self.requestNotificationPermission()
             }
         }
+        // Listen for foreground transitions so we can re-sync state.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleForegroundTransition),
+            name: UIApplication.willEnterForegroundNotification,
+            object: nil
+        )
         if !ipAddress.isEmpty && autoConnect {
             startPolling()
         }
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    @objc private func handleForegroundTransition() {
+        lastForegroundTime = Date()
+        // Force a fresh status fetch immediately on foreground return
+        fetchStatusNow()
+        fetchLogsNow()
     }
 
     // MARK: - Settings
@@ -119,7 +143,7 @@ class AppState: ObservableObject {
         stopPolling()
     }
 
-    // MARK: - Polling with backoff
+    // MARK: - Polling
     func startPolling() {
         stopPolling()
         guard !ipAddress.isEmpty else {
@@ -175,7 +199,6 @@ class AppState: ObservableObject {
         UNUserNotificationCenter.current().getNotificationSettings { settings in
             if settings.authorizationStatus == .notDetermined {
                 self.requestNotificationPermission()
-                // Wait for user to respond, then send
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
                     self.sendNotification(title: "Reconnector Test", body: "Notifications are working!")
                 }
@@ -187,6 +210,20 @@ class AppState: ObservableObject {
                 self.sendNotification(title: "Reconnector Test", body: "Notifications are working!")
             }
         }
+    }
+
+    // MARK: - Centralized "mark connected" — any successful API call flips this on
+    private func markConnected() {
+        let wasConnected = self.isConnected
+        self.isConnected = true
+        self.consecutiveFailures = 0
+        self.connectionError = nil
+        self.lastConnectionTime = Date()
+        self.isConnecting = false
+        if wasConnected == false && lastNotificationState == true && notifyOnReconnect {
+            sendNotification(title: "Reconnected", body: "Backend connection restored.")
+        }
+        lastNotificationState = true
     }
 
     // MARK: - Status polling
@@ -209,41 +246,49 @@ class AppState: ObservableObject {
     }
 
     private func handleStatusSuccess(_ status: BotStatus) {
-        let wasConnected = self.isConnected
+        markConnected()
         self.status = status
-        self.lastConnectionTime = Date()
-        self.isConnected = true
-        self.connectionError = nil
-        self.consecutiveFailures = 0
         self.watchdogEnabled = status.watchdog_enabled
         self.watchdogInterval = status.interval
         self.gameLink = status.game_link
-        // Pull optimization state from server so we stay in sync after backend restart
-        // but only if user is not actively toggling right now.
-        if !isPerformingAction {
+
+        // Sync optimization state from server — but ONLY for toggles the user
+        // isn't actively pressing. Active toggles are owned by the optimistic UI
+        // until their POST completes.
+        if !pendingOptimizationToggles.contains("kill_bg") {
             self.optKillBg = status.optimizations.kill_bg
+        }
+        if !pendingOptimizationToggles.contains("process_limit") {
             self.optProcessLimit = status.optimizations.process_limit
+        }
+        if !pendingOptimizationToggles.contains("no_animations") {
             self.optNoAnimations = status.optimizations.no_animations
+        }
+        if !pendingOptimizationToggles.contains("force_gpu") {
             self.optForceGpu = status.optimizations.force_gpu
+        }
+        if !pendingOptimizationToggles.contains("no_bluetooth") {
             self.optNoBluetooth = status.optimizations.no_bluetooth
         }
-        // Notify on reconnect (but avoid spamming on first successful connect)
-        if wasConnected == false && lastNotificationState == true && notifyOnReconnect {
-            sendNotification(title: "Reconnected", body: "Backend connection restored.")
-        }
-        lastNotificationState = true
     }
 
     private func handleStatusFailure(_ error: Error?) {
         consecutiveFailures += 1
-        let wasConnected = self.isConnected
-        self.isConnected = false
-        self.connectionError = "Cannot reach backend (attempt \(consecutiveFailures))"
-        // Only notify on the *first* transition from connected -> disconnected
-        if wasConnected && lastNotificationState != false && notifyOnDisconnect {
-            sendNotification(title: "Disconnected", body: "Lost connection to backend.")
+        // Only flip to "disconnected" after N consecutive failures.
+        // This prevents false disconnects when a single poll times out
+        // but other API calls (screenshot, optimize, etc.) are succeeding.
+        if consecutiveFailures >= DISCONNECT_THRESHOLD {
+            let wasConnected = self.isConnected
+            self.isConnected = false
+            self.connectionError = "Cannot reach backend (\(consecutiveFailures) failed polls)"
+            if wasConnected && lastNotificationState != false && notifyOnDisconnect {
+                sendNotification(title: "Disconnected", body: "Lost connection to backend.")
+            }
+            lastNotificationState = false
+        } else {
+            // Single poll failure — keep current connected state, but show a soft warning
+            self.connectionError = "Reaching backend... (attempt \(consecutiveFailures))"
         }
-        lastNotificationState = false
     }
 
     // MARK: - Logs polling
@@ -256,8 +301,9 @@ class AppState: ObservableObject {
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let logLines = json["logs"] as? [String] else { return }
-            // If user just cleared logs and the server returns an empty list, keep it empty.
+            // Any successful API response means we ARE connected.
             DispatchQueue.main.async {
+                self.markConnected()
                 if logLines.isEmpty {
                     self.logs = []
                 } else {
@@ -268,16 +314,13 @@ class AppState: ObservableObject {
     }
 
     func clearLogs() {
-        // 1. Clear local state immediately
         logs.removeAll()
-        // 2. Tell backend to flush its file handlers too
         guard !ipAddress.isEmpty else { return }
         let url = URL(string: "http://\(ipAddress):8080/api/clear-logs")!
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 5
         URLSession.shared.dataTask(with: request) { _, _, _ in
-            // Force a fresh fetch to confirm
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 self.fetchLogsNow()
             }
@@ -307,7 +350,6 @@ class AppState: ObservableObject {
         actionProgress = 1.0
         if let error = error {
             actionError = error
-            // Keep overlay visible briefly so the user sees the error
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 self?.isPerformingAction = false
                 self?.actionProgress = 0
@@ -335,8 +377,8 @@ class AppState: ObservableObject {
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let enabled = json["enabled"] as? Bool {
                     self.watchdogEnabled = enabled
+                    self.markConnected()
                 } else if (response as? HTTPURLResponse)?.statusCode != 200 {
-                    // Rollback
                     self.watchdogEnabled = oldValue
                     self.actionError = "Failed to toggle watchdog."
                 }
@@ -356,20 +398,24 @@ class AppState: ObservableObject {
         default: return
         }
         let newValue = !oldValue
+
+        // Mark this toggle as "in-flight" so polling doesn't clobber it
+        pendingOptimizationToggles.insert(name)
+
         let url = URL(string: "http://\(ipAddress):8080/api/optimize/\(name)")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONSerialization.data(withJSONObject: ["enabled": newValue])
         request.timeoutInterval = 10
-        isPerformingAction = false  // toggles shouldn't show fullscreen overlay
+
         URLSession.shared.dataTask(with: request) { data, response, _ in
             DispatchQueue.main.async {
+                self.pendingOptimizationToggles.remove(name)
                 if let data = data,
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    json["status"] as? String == "ok" {
-                    // Server confirmed - state stays as user toggled
-                    // Optionally trust server echo:
+                    // Trust the server echo for ALL toggles
                     if let opts = json["optimizations"] as? [String: Any] {
                         self.optKillBg = opts["kill_bg"] as? Bool ?? self.optKillBg
                         self.optProcessLimit = opts["process_limit"] as? Bool ?? self.optProcessLimit
@@ -377,8 +423,8 @@ class AppState: ObservableObject {
                         self.optForceGpu = opts["force_gpu"] as? Bool ?? self.optForceGpu
                         self.optNoBluetooth = opts["no_bluetooth"] as? Bool ?? self.optNoBluetooth
                     }
+                    self.markConnected()
                 } else if (response as? HTTPURLResponse)?.statusCode != 200 {
-                    // Rollback on failure
                     switch name {
                     case "kill_bg": self.optKillBg = oldValue
                     case "process_limit": self.optProcessLimit = oldValue
@@ -400,21 +446,20 @@ class AppState: ObservableObject {
 
     // MARK: - Restart Roblox
     func restartRoblox() {
-        startAction(name: "Restarting Roblox", estimatedSeconds: 12)
+        startAction(name: "Restarting Roblox", estimatedSeconds: 15)
         let url = URL(string: "http://\(ipAddress):8080/api/restart")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = 30
         URLSession.shared.dataTask(with: request) { data, response, error in
-            // Backend kicks off restart in background; we poll for completion.
             DispatchQueue.main.async {
                 if error != nil || (response as? HTTPURLResponse)?.statusCode != 200 {
                     self.endAction(error: "Failed to initiate restart.")
                     return
                 }
+                self.markConnected()
             }
-            // Poll status until roblox_state is no longer "reconnecting" (max 25s)
-            self.waitForRestartCompletion(maxSeconds: 25)
+            self.waitForRestartCompletion(maxSeconds: 30)
         }.resume()
     }
 
@@ -436,9 +481,10 @@ class AppState: ObservableObject {
                         return
                     }
                     self.status = s
+                    self.markConnected()
                     let elapsed = Int(Date().timeIntervalSince(start))
-                    if s.roblox_state != "reconnecting" && elapsed > 4 {
-                        // Give it a moment to settle, then dismiss
+                    // Once Roblox is no longer "reconnecting" AND we've given it time to settle
+                    if s.roblox_state != "reconnecting" && elapsed > 5 {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                             self.endAction(error: s.roblox_state == "offline" ? "Restart failed." : nil)
                         }
@@ -465,6 +511,7 @@ class AppState: ObservableObject {
                    let imgData = Data(base64Encoded: imgStr),
                    let image = UIImage(data: imgData) {
                     self.screenshotImage = image
+                    self.markConnected()
                     self.endAction()
                 } else {
                     self.endAction(error: "Failed to capture screenshot.")
@@ -473,9 +520,9 @@ class AppState: ObservableObject {
         }.resume()
     }
 
-    // MARK: - 3-second proving video
+    // MARK: - 3-second video (just record + display + log)
     func fetchVideo() {
-        startAction(name: "Recording 3s Proving Video", estimatedSeconds: 6)
+        startAction(name: "Recording 3s Video", estimatedSeconds: 6)
         let url = URL(string: "http://\(ipAddress):8080/api/video")!
         URLSession.shared.dataTask(with: url) { data, _, _ in
             DispatchQueue.main.async {
@@ -485,9 +532,10 @@ class AppState: ObservableObject {
                    !vidStr.isEmpty,
                    let vidData = Data(base64Encoded: vidStr) {
                     self.videoData = vidData
+                    self.markConnected()
                     self.endAction()
                 } else {
-                    self.endAction(error: "Failed to record proving video.")
+                    self.endAction(error: "Failed to record video.")
                 }
             }
         }.resume()
@@ -500,7 +548,10 @@ class AppState: ObservableObject {
         URLSession.shared.dataTask(with: url) { data, _, _ in
             guard let data = data,
                   let response = try? JSONDecoder().decode(CrashResponse.self, from: data) else { return }
-            DispatchQueue.main.async { self.crashes = response.crashes }
+            DispatchQueue.main.async {
+                self.crashes = response.crashes
+                self.markConnected()
+            }
         }.resume()
     }
 
@@ -511,7 +562,9 @@ class AppState: ObservableObject {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = 8
-        URLSession.shared.dataTask(with: request) { _, _, _ in }.resume()
+        URLSession.shared.dataTask(with: request) { _, _, _ in
+            DispatchQueue.main.async { self.markConnected() }
+        }.resume()
     }
 
     // MARK: - Game link
@@ -530,6 +583,7 @@ class AppState: ObservableObject {
                    json["status"] as? String == "ok" {
                     self.gameLink = link
                     self.status?.game_link = link
+                    self.markConnected()
                     completion(true)
                 } else {
                     completion(false)
@@ -555,6 +609,7 @@ class AppState: ObservableObject {
                    let interval = json["interval"] as? Int {
                     self.watchdogInterval = interval
                     self.status?.interval = interval
+                    self.markConnected()
                 } else if (response as? HTTPURLResponse)?.statusCode != 200 {
                     self.watchdogInterval = oldValue
                 }
@@ -564,7 +619,6 @@ class AppState: ObservableObject {
 
     // MARK: - Async wrappers for SwiftUI .task
     func fetchStatus() async {
-        // Just trigger the synchronous polling fetch; don't block
         fetchStatusNow()
     }
 }

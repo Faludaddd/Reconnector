@@ -31,7 +31,7 @@ struct ControlView: View {
                                 appState.fetchScreenshot()
                                 showingScreenshot = true
                             }
-                            AppActionButton("3s Proving Video",
+                            AppActionButton("3s Video",
                                             icon: "video.fill",
                                             disabled: appState.isPerformingAction) {
                                 appState.fetchVideo()
