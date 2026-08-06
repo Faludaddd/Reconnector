@@ -187,7 +187,9 @@ struct ConnectionBanner: View {
     private var detail: String {
         if isConnected {
             if let last = lastSeen {
-                return "Last update \(last, style: .relative) ago"
+                let formatter = RelativeDateTimeFormatter()
+                formatter.unitsStyle = .abbreviated
+                return "Last update \(formatter.localizedString(for: last, relativeTo: Date()))"
             }
             return "Live"
         }
