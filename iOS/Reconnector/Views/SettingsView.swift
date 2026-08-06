@@ -6,62 +6,154 @@ struct SettingsView: View {
     @State private var tokenInput = ""
     @State private var showingSavedAlert = false
     @State private var showingResetAlert = false
-    
+    @State private var notificationStatus: String = ""
+
     var body: some View {
         NavigationView {
             Form {
+                // MARK: - Connection
                 Section("Connection") {
-                    TextField("IP Address", text: $ipInput).keyboardType(.decimalPad).disableAutocorrection(true)
-                    SecureField("Auth Token", text: $tokenInput).disableAutocorrection(true)
+                    TextField("IP Address", text: $ipInput)
+                        .keyboardType(.decimalPad)
+                        .disableAutocorrection(true)
+                        .autocapitalization(.none)
+                    SecureField("Auth Token", text: $tokenInput)
+                        .disableAutocorrection(true)
+                        .autocapitalization(.none)
                     Toggle("Auto-Connect on Launch", isOn: $appState.autoConnect)
-                    Button("Save & Reconnect") { appState.ipAddress = ipInput; appState.authToken = tokenInput; appState.saveSettings(); showingSavedAlert = true }
-                }
-                
-                Section("Watchdog") {
-                    if let status = appState.status {
-                        Picker("Check Interval", selection: Binding(get: { status.interval }, set: { newValue in Task { try? await APIClient(ipAddress: appState.ipAddress, authToken: appState.authToken).setInterval(minutes: newValue) } })) {
-                            Text("1 min").tag(1); Text("5 min").tag(5); Text("10 min").tag(10); Text("15 min").tag(15); Text("30 min").tag(30)
-                        }
+                    Button("Save & Reconnect") {
+                        appState.ipAddress = ipInput
+                        appState.authToken = tokenInput
+                        appState.saveConnectionSettings()
+                        showingSavedAlert = true
                     }
                 }
-                
-                Section("Notifications") {
+
+                // MARK: - Notifications
+                Section {
                     Toggle("Disconnect Alerts", isOn: $appState.notifyOnDisconnect)
                     Toggle("Reconnect Alerts", isOn: $appState.notifyOnReconnect)
                     Toggle("Error Alerts", isOn: $appState.notifyOnError)
-                    Button("Send Test Notification") { appState.sendTestNotification() }
+                    Button("Send Test Notification") {
+                        appState.sendTestNotification()
+                    }
+                    if !notificationStatus.isEmpty {
+                        Text(notificationStatus)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                } header: {
+                    HStack {
+                        Text("Notifications")
+                        Spacer()
+                        Button {
+                            refreshNotificationStatus()
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .buttonStyle(.borderless)
+                    }
                 }
-                .onChange(of: appState.notifyOnDisconnect) { _ in appState.saveSettings() }
-                .onChange(of: appState.notifyOnReconnect) { _ in appState.saveSettings() }
-                
+
+                // MARK: - Logs
                 Section("Logs") {
-                    Picker("Log Level", selection: $appState.logLevel) { Text("INFO").tag("INFO"); Text("WARNING").tag("WARNING"); Text("ERROR").tag("ERROR") }
                     Toggle("Auto-Scroll", isOn: $appState.autoScrollLogs)
                 }
-                .onChange(of: appState.logLevel) { _ in appState.saveSettings() }
-                .onChange(of: appState.autoScrollLogs) { _ in appState.saveSettings() }
-                
+
+                // MARK: - Connection Status
                 Section("Connection Status") {
-                    HStack { Image(systemName: appState.isConnected ? "checkmark.circle.fill" : "xmark.circle.fill").foregroundColor(appState.isConnected ? .green : .red); Text("Status"); Spacer(); Text(appState.isConnected ? "Connected" : "Disconnected") }
-                    if let lastTime = appState.lastConnectionTime { HStack { Text("Last Update"); Spacer(); Text(lastTime, style: .relative).foregroundColor(.secondary) } }
-                    if let error = appState.connectionError { Text(error).font(.caption).foregroundColor(.red) }
-                    Button("Reconnect Now") { appState.connectWebSocket() }
+                    HStack {
+                        Image(systemName: appState.isConnected ? "checkmark.circle.fill" : "xmark.circle.fill")
+                            .foregroundColor(appState.isConnected ? .green : .red)
+                        Text("Status")
+                        Spacer()
+                        Text(appState.isConnected ? "Connected" : "Disconnected")
+                    }
+                    if let lastTime = appState.lastConnectionTime {
+                        HStack {
+                            Text("Last Update")
+                            Spacer()
+                            Text(lastTime, style: .relative).foregroundColor(.secondary)
+                        }
+                    }
+                    if let error = appState.connectionError {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                    }
+                    Button("Reconnect Now") { appState.reconnect() }
                 }
-                
-                Section { NavigationLink { SetupGuideView() } label: { Label("Setup Guide", systemImage: "book.fill") } }
-                
+
+                // MARK: - Setup guide
+                Section {
+                    NavigationLink {
+                        SetupGuideView()
+                    } label: {
+                        Label("Setup Guide", systemImage: "book.fill")
+                    }
+                }
+
+                // MARK: - About
                 Section("About") {
-                    HStack { Text("Version"); Spacer(); Text("1.0.7").foregroundColor(.secondary) }
-                    HStack { Text("Backend"); Spacer(); Text(appState.status != nil ? "Online" : "Offline").foregroundColor(appState.status != nil ? .green : .red) }
-                    Button(role: .destructive) { showingResetAlert = true } label: { Label("Reset All Settings", systemImage: "trash") }
+                    HStack {
+                        Text("Version")
+                        Spacer()
+                        Text("1.1.0").foregroundColor(.secondary)
+                    }
+                    HStack {
+                        Text("Backend")
+                        Spacer()
+                        Text(appState.status != nil ? "Online" : "Offline")
+                            .foregroundColor(appState.status != nil ? .green : .red)
+                    }
+                    Button(role: .destructive) {
+                        showingResetAlert = true
+                    } label: {
+                        Label("Reset All Settings", systemImage: "trash")
+                    }
                 }
             }
             .navigationTitle("Settings")
-            .alert("Settings Saved", isPresented: $showingSavedAlert) { Button("OK", role: .cancel) {} }
-            .alert("Reset Settings?", isPresented: $showingResetAlert) { Button("Cancel", role: .cancel) {}; Button("Reset", role: .destructive) { appState.resetSettings(); ipInput = ""; tokenInput = "" } }
-            .onAppear { ipInput = appState.ipAddress; tokenInput = appState.authToken }
+            .alert("Settings Saved", isPresented: $showingSavedAlert) {
+                Button("OK", role: .cancel) {}
+            }
+            .alert("Reset Settings?", isPresented: $showingResetAlert) {
+                Button("Cancel", role: .cancel) {}
+                Button("Reset", role: .destructive) {
+                    appState.resetSettings()
+                    ipInput = ""
+                    tokenInput = ""
+                }
+            }
+            .onAppear {
+                ipInput = appState.ipAddress
+                tokenInput = appState.authToken
+                refreshNotificationStatus()
+            }
             .scrollDismissesKeyboard(.interactively)
-        }.navigationViewStyle(.stack)
+        }
+        .navigationViewStyle(.stack)
+    }
+
+    private func refreshNotificationStatus() {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            DispatchQueue.main.async {
+                switch settings.authorizationStatus {
+                case .authorized:
+                    notificationStatus = "Permission granted. Alerts: \(settings.alertSetting == .enabled ? "on" : "off")"
+                case .denied:
+                    notificationStatus = "Blocked. Please enable in iOS Settings."
+                case .notDetermined:
+                    notificationStatus = "Not requested yet. Tap Test Notification."
+                case .provisional:
+                    notificationStatus = "Provisional permission only."
+                case .ephemeral:
+                    notificationStatus = "Ephemeral permission."
+                @unknown default:
+                    notificationStatus = ""
+                }
+            }
+        }
     }
 }
 
@@ -70,19 +162,45 @@ struct SetupGuideView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 12) { ZStack { Circle().fill(Color.blue).frame(width: 28, height: 28); Text("1").font(.caption).fontWeight(.bold).foregroundColor(.white) }; Text("Start the Backend").font(.headline) }
-                    Text("Open Termux and run:").font(.subheadline).foregroundColor(.secondary)
-                    Text("python ~/reconnector/Backend/reconnector_api.py").font(.system(.caption, design: .monospaced)).padding(10).background(Color(UIColor.tertiarySystemBackground)).cornerRadius(8)
+                    HStack(spacing: 12) {
+                        ZStack {
+                            Circle().fill(Color.accentColor).frame(width: 28, height: 28)
+                            Text("1").font(.caption).fontWeight(.bold).foregroundColor(.white)
+                        }
+                        Text("Start the Backend").font(.headline)
+                    }
+                    Text("Open Termux and run:").font(AppTheme.bodyFont).foregroundColor(.secondary)
+                    Text("python ~/reconnector/Backend/reconnector_api.py")
+                        .font(.system(.caption, design: .monospaced))
+                        .padding(10)
+                        .background(AppTheme.subtleBackground)
+                        .cornerRadius(8)
                 }
                 Divider()
                 VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 12) { ZStack { Circle().fill(Color.blue).frame(width: 28, height: 28); Text("2").font(.caption).fontWeight(.bold).foregroundColor(.white) }; Text("Find IP Address").font(.headline) }
-                    Text("Run 'ifconfig' in Termux. Look for wlan0 IP (e.g., 192.168.1.70)").font(.subheadline).foregroundColor(.secondary)
+                    HStack(spacing: 12) {
+                        ZStack {
+                            Circle().fill(Color.accentColor).frame(width: 28, height: 28)
+                            Text("2").font(.caption).fontWeight(.bold).foregroundColor(.white)
+                        }
+                        Text("Find IP Address").font(.headline)
+                    }
+                    Text("Run 'ifconfig' in Termux. Look for wlan0 IP (e.g., 192.168.1.70)")
+                        .font(AppTheme.bodyFont)
+                        .foregroundColor(.secondary)
                 }
                 Divider()
                 VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 12) { ZStack { Circle().fill(Color.blue).frame(width: 28, height: 28); Text("3").font(.caption).fontWeight(.bold).foregroundColor(.white) }; Text("Connect App").font(.headline) }
-                    Text("Enter IP and token in Settings. Default token: reconnector123").font(.subheadline).foregroundColor(.secondary)
+                    HStack(spacing: 12) {
+                        ZStack {
+                            Circle().fill(Color.accentColor).frame(width: 28, height: 28)
+                            Text("3").font(.caption).fontWeight(.bold).foregroundColor(.white)
+                        }
+                        Text("Connect App").font(.headline)
+                    }
+                    Text("Enter IP and token in Settings. Default token: reconnector123")
+                        .font(AppTheme.bodyFont)
+                        .foregroundColor(.secondary)
                 }
                 Divider()
                 VStack(alignment: .leading, spacing: 12) {
@@ -91,10 +209,14 @@ struct SetupGuideView: View {
                         Text("• Both devices must be on same WiFi")
                         Text("• Backend must be running in Termux")
                         Text("• Roblox must be installed on tablet")
-                    }.font(.subheadline).foregroundColor(.secondary)
+                    }
+                    .font(AppTheme.bodyFont)
+                    .foregroundColor(.secondary)
                 }
-            }.padding(20)
+            }
+            .padding(20)
         }
-        .navigationTitle("Setup Guide").navigationBarTitleDisplayMode(.inline)
+        .navigationTitle("Setup Guide")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }

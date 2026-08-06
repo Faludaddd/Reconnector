@@ -6,7 +6,7 @@ struct LogsView: View {
     @State private var selectedLevel = "ALL"
     @State private var multiSelectMode = false
     @State private var selectedEntries: Set<UUID> = []
-    
+
     var filteredLogs: [LogEntry] {
         var result = appState.logs
         if selectedLevel != "ALL" {
@@ -17,52 +17,83 @@ struct LogsView: View {
         }
         return result
     }
-    
+
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
                 // Filter bar
-                HStack {
+                HStack(spacing: 8) {
                     Picker("Level", selection: $selectedLevel) {
                         Text("All").tag("ALL")
                         Text("INFO").tag("INFO")
-                        Text("WARNING").tag("WARNING")
+                        Text("WARN").tag("WARNING")
                         Text("ERROR").tag("ERROR")
-                    }.pickerStyle(.segmented).frame(width: 250)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 240)
+
                     Spacer()
-                    Button { 
-                        appState.logs.removeAll()
-                        appState.clearLogsServer()
-                    } label: { Image(systemName: "trash") }.disabled(appState.logs.isEmpty)
-                    Button { UIPasteboard.general.string = appState.logs.map { $0.text }.joined(separator: "\n") } label: { Image(systemName: "doc.on.doc") }.disabled(appState.logs.isEmpty)
+
+                    Button {
+                        appState.clearLogs()
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .disabled(appState.logs.isEmpty)
+
+                    Button {
+                        UIPasteboard.general.string = appState.logs.map { $0.text }.joined(separator: "\n")
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .disabled(appState.logs.isEmpty)
                 }
-                .padding(.horizontal, 12).padding(.vertical, 8)
-                
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+
                 if filteredLogs.isEmpty {
-                    VStack(spacing: 16) {
-                        Image(systemName: "doc.text.magnifyingglass").font(.system(size: 40)).foregroundColor(.secondary)
-                        Text(appState.logs.isEmpty ? "No logs yet" : "No matching logs").font(.headline)
-                        if appState.logs.isEmpty { Text("Logs will appear here in real-time.").font(.subheadline).foregroundColor(.secondary) }
-                    }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                    VStack(spacing: 14) {
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .font(.system(size: 38))
+                            .foregroundColor(.secondary)
+                        Text(appState.logs.isEmpty ? "No logs yet" : "No matching logs")
+                            .font(.headline)
+                        if appState.logs.isEmpty {
+                            Text("Logs will appear here in real-time.")
+                                .font(AppTheme.bodyFont)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     ScrollViewReader { proxy in
                         ScrollView {
                             LazyVStack(alignment: .leading, spacing: 2) {
                                 ForEach(filteredLogs) { entry in
-                                    LogRow(entry: entry, multiSelect: multiSelectMode, isSelected: selectedEntries.contains(entry.id)) {
+                                    LogRow(entry: entry,
+                                           multiSelect: multiSelectMode,
+                                           isSelected: selectedEntries.contains(entry.id)) {
                                         if multiSelectMode {
-                                            if selectedEntries.contains(entry.id) { selectedEntries.remove(entry.id) }
-                                            else { selectedEntries.insert(entry.id) }
+                                            if selectedEntries.contains(entry.id) {
+                                                selectedEntries.remove(entry.id)
+                                            } else {
+                                                selectedEntries.insert(entry.id)
+                                            }
                                         } else {
                                             UIPasteboard.general.string = entry.text
                                         }
                                     }
                                     .id(entry.id)
                                 }
-                            }.padding(.vertical, 8)
+                            }
+                            .padding(.vertical, 8)
                         }
                         .onChange(of: appState.logs.count) { _ in
-                            if appState.autoScrollLogs { if let last = filteredLogs.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } } }
+                            if appState.autoScrollLogs {
+                                if let last = filteredLogs.last {
+                                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                                }
+                            }
                         }
                     }
                 }
@@ -71,10 +102,14 @@ struct LogsView: View {
             .searchable(text: $searchText, prompt: "Search logs")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button(multiSelectMode ? "Done" : "Select") { multiSelectMode.toggle(); if !multiSelectMode { selectedEntries.removeAll() } }
+                    Button(multiSelectMode ? "Done" : "Select") {
+                        multiSelectMode.toggle()
+                        if !multiSelectMode { selectedEntries.removeAll() }
+                    }
                 }
             }
-        }.navigationViewStyle(.stack)
+        }
+        .navigationViewStyle(.stack)
     }
 }
 
@@ -83,28 +118,48 @@ struct LogRow: View {
     let multiSelect: Bool
     let isSelected: Bool
     let onTap: () -> Void
-    
+
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             if multiSelect {
-                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle").foregroundColor(isSelected ? .blue : .gray)
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(isSelected ? .accentColor : .gray)
             }
-            Text(timeString(entry.timestamp)).font(.system(.caption2, design: .monospaced)).foregroundColor(.secondary)
-            Text(entry.text).font(.system(.caption, design: .monospaced)).foregroundColor(colorForLog(entry.text)).frame(maxWidth: .infinity, alignment: .leading)
+            Text(timeString(entry.timestamp))
+                .font(AppTheme.monoFont)
+                .foregroundColor(.secondary)
+            Text(entry.text)
+                .font(AppTheme.monoFont)
+                .foregroundColor(colorForLog(entry.text))
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(.horizontal, 16).padding(.vertical, 2)
-        .background(isSelected ? Color.blue.opacity(0.1) : Color.clear)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 2)
+        .background(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
         .contentShape(Rectangle())
         .onTapGesture { onTap() }
     }
-    
-    private func timeString(_ date: Date) -> String { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f.string(from: date) }
+
+    private func timeString(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f.string(from: date)
+    }
+
     private func colorForLog(_ log: String) -> Color {
         let l = log.lowercased()
-        if l.contains("[error]") || l.contains("crash") || l.contains("failed") { return .red }
-        if l.contains("[warning]") { return .yellow }
-        if l.contains("[success]") || l.contains("successful") { return .green }
-        if l.contains("[startup]") { return .blue }
+        if l.contains("[error]") || l.contains("crash") || l.contains("failed") {
+            return .red
+        }
+        if l.contains("[warning]") || l.contains("[warn]") {
+            return .yellow
+        }
+        if l.contains("[success]") || l.contains("successful") {
+            return .green
+        }
+        if l.contains("[startup]") {
+            return .blue
+        }
         return .primary
     }
 }

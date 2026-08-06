@@ -16,7 +16,7 @@ struct BotStatus: Codable {
     var is_paused: Bool
     var interval: Int
     var game_link: String
-    var brightness: Int
+    var brightness: Int?
     var last_crash_reason: String?
     var last_reconnect: Int?
     var bot_uptime: Int?
@@ -52,3 +52,18 @@ struct ScreenshotResponse: Codable {
     let error: String?
 }
 
+struct VideoResponse: Codable {
+    let video: String
+    let error: String?
+}
+
+struct GenericResponse: Codable {
+    let status: String?
+    let enabled: Bool?
+    let interval: Int?
+    let game_link: String?
+    let name: String?
+    let optimizations: Optimizations?
+    let estimated_seconds: Int?
+    let error: String?
+}
