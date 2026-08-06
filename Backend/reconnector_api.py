@@ -1,7 +1,9 @@
 """
-Reconnector API Server v9
+Reconnector API Server v10
 - Single intelligent recovery flow (no multi-attempt logs)
-- Smart watchdog state machine (no false positives during launches)
+- Smart watchdog state machine with ACTIVE re-confirmation burst
+  (no more false restarts from flaky pidof reads)
+- Stats persist across backend restarts with day-boundary resets
 - Background-cached system info (battery/internet/temp/uptime) — status endpoint <100ms
 - Stable log clearing
 - All endpoints echo state for client confirmation
@@ -21,6 +23,7 @@ PACKAGE = "com.roblox.client"
 BASE_DIR = "/data/data/com.termux/files/home"
 LOG_FILE = f"{BASE_DIR}/reconnector.log"
 DISCONNECT_SIGNAL_FILE = "/sdcard/AE_disconnect_signal.txt"
+STATS_FILE = f"{BASE_DIR}/.reconnector_stats.json"
 HOST = "0.0.0.0"
 PORT = 8080
 DEFAULT_TIMEOUT = 15
@@ -59,8 +62,15 @@ API_KEY = _load_or_create_api_key()
 
 # How long after a reconnect before we trust Roblox is healthy.
 POST_RECONNECT_GRACE_SEC = 60
-# How long after we last saw a PID before declaring Roblox dead.
-DEATH_CONFIRMATION_SEC = 20
+# When a health check comes back "no live PID", we don't immediately declare
+# death — we run an ACTIVE re-confirmation burst: this many checks, this many
+# seconds apart. Only if ALL of them fail do we declare Roblox dead.
+# This eliminates false restarts from flaky rish/pidof reads (which we proved
+# earlier can return inconsistent output for the identical command back-to-back).
+DEATH_CONFIRMATION_CHECKS = 3
+DEATH_CONFIRMATION_INTERVAL_SEC = 5
+# Legacy alias kept for any code that still references it.
+DEATH_CONFIRMATION_SEC = DEATH_CONFIRMATION_CHECKS * DEATH_CONFIRMATION_INTERVAL_SEC
 # Background refresh interval for slow system queries.
 SYS_REFRESH_INTERVAL_SEC = 15
 
@@ -102,6 +112,57 @@ except Exception:
     pass
 
 
+_stats_lock = threading.Lock()
+
+
+def _today_str():
+    """Local date string for day-boundary reset tracking."""
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _load_persisted_stats():
+    """Load stats from disk. Returns dict with 'date' and 'stats' keys, or fresh defaults."""
+    try:
+        if os.path.exists(STATS_FILE):
+            with open(STATS_FILE, 'r') as f:
+                data = json.load(f)
+            today = _today_str()
+            # Day-boundary reset: if the saved date is not today, zero out stats
+            if data.get("date") != today:
+                logger.info(f"[STATS] Day rollover detected ({data.get('date')} -> {today}), resetting stats")
+                return {"date": today, "stats": {"crashes": 0, "kicks": 0, "network_drops": 0}}
+            return data
+    except Exception as e:
+        logger.warning(f"[STATS] Failed to load persisted stats: {e}")
+    return {"date": _today_str(), "stats": {"crashes": 0, "kicks": 0, "network_drops": 0}}
+
+
+def _persist_stats_impl():
+    """Save current stats to disk. Called after every state change."""
+    with _stats_lock:
+        try:
+            data = {"date": _today_str(), "stats": dict(state.stats)}
+            with open(STATS_FILE, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            logger.warning(f"[STATS] Failed to persist stats: {e}")
+
+
+def _check_day_rollover_impl():
+    """If the date has changed since stats were last saved, reset to zero."""
+    with _stats_lock:
+        try:
+            if os.path.exists(STATS_FILE):
+                with open(STATS_FILE, 'r') as f:
+                    data = json.load(f)
+                if data.get("date") != _today_str():
+                    logger.info(f"[STATS] Day rollover detected, resetting stats")
+                    state.stats = {"crashes": 0, "kicks": 0, "network_drops": 0}
+                    _persist_stats_impl()
+        except Exception:
+            pass
+
+
 class State:
     current_game_link = "https://www.roblox.com/games/84515722934860/Anime-Expeditions"
     is_paused = False
@@ -139,6 +200,18 @@ class State:
 
 state = State()
 reconnect_lock = threading.Lock()
+
+
+def _persist_stats():
+    """Public wrapper — save current stats to disk. Called after every state change."""
+    _persist_stats_impl()
+
+
+def _check_day_rollover():
+    """Public wrapper — if the date has changed since stats were last saved, reset to zero."""
+    _check_day_rollover_impl()
+
+
 _state_lock = threading.Lock()
 
 
@@ -345,6 +418,7 @@ def reconnect_game(reason="unknown"):
         state.crash_log.insert(0, {"timestamp": int(time.time()), "reason": reason})
         if len(state.crash_log) > 50:
             state.crash_log = state.crash_log[:50]
+        _persist_stats()
 
         logger.info(f"[RECONNECT] Reconnect started. Reason: {reason}")
         m = re.search(r'/games/(\d+)', state.current_game_link)
@@ -477,6 +551,20 @@ def clear_logs():
 # SMART WATCHDOG — STATE MACHINE
 # Distinguishes: launching | healthy | transitioning | closing | crashed
 # ---------------------------------------------------------------------------
+def _is_roblox_confirmed_alive():
+    """Quick single-check: is Roblox definitely alive right now?
+    Returns True only if BOTH the PID exists AND the activity manager knows about it.
+    Used by the re-confirmation burst — one False here doesn't mean death, it just
+    means 'this single check couldn't confirm life'."""
+    pid = get_roblox_pid()
+    if not pid:
+        return False
+    if not is_process_alive(pid):
+        return False
+    activity_state = get_roblox_activity_state()
+    return activity_state in ("foreground", "background")
+
+
 def evaluate_roblox_health():
     """Returns (action_needed: bool, reason: str).
 
@@ -485,8 +573,11 @@ def evaluate_roblox_health():
     - In post-reconnect grace → healthy
     - Recovery in progress → skip
     - Both PID + activity alive → check OCR for disconnect text
-    - PID alive but activity stopped (or vice versa) → transitioning, wait
-    - Neither alive for >= DEATH_CONFIRMATION_SEC → recovery needed
+    - Not confirmed alive → ACTIVE re-confirmation burst:
+        run DEATH_CONFIRMATION_CHECKS checks, DEATH_CONFIRMATION_INTERVAL_SEC apart.
+        If ANY check confirms life, abort the burst and return healthy.
+        Only if ALL checks fail do we declare Roblox dead.
+      This eliminates false restarts from flaky rish/pidof reads.
     """
     # Signal 1: Lua disconnect file (highest priority)
     try:
@@ -527,21 +618,29 @@ def evaluate_roblox_health():
                     state.consecutive_ocr_hits = 0
                     category = _classify_disconnect_text(matched)
                     state.stats[category] += 1
+                    _persist_stats()
                     return True, f"ocr_disconnect_{category}"
             else:
                 state.consecutive_ocr_hits = 0
         _set_state("healthy")
         return False, "healthy"
 
-    # CASE B: not fully confirmed alive - either genuinely dead, or mid-transition
-    # (launching, backgrounding, etc). Distinguish by how long it's been since we
-    # last saw a live PID, using one consistent grace window either way.
-    time_since_pid = time.time() - state.last_pid_seen_time
-    if time_since_pid < DEATH_CONFIRMATION_SEC:
-        logger.info(f"[WATCHDOG] Transitional state (pid={pid_alive}, act={activity_state}) — waiting")
-        return False, "transitioning"
+    # CASE B: Not confirmed alive on this single check.
+    # Don't immediately declare death — run an ACTIVE re-confirmation burst.
+    # rish/pidof have been observed to return inconsistent output for the
+    # identical command across back-to-back calls, so one miss is not enough.
+    logger.info(f"[WATCHDOG] Initial check inconclusive (pid={pid_alive}, act={activity_state}) — starting re-confirmation burst")
+    for i in range(DEATH_CONFIRMATION_CHECKS):
+        time.sleep(DEATH_CONFIRMATION_INTERVAL_SEC)
+        if _is_roblox_confirmed_alive():
+            state.last_pid_seen_time = time.time()
+            logger.info(f"[WATCHDOG] Re-confirmation burst check {i+1}/{DEATH_CONFIRMATION_CHECKS} — Roblox is alive (false alarm avoided)")
+            _set_state("healthy")
+            return False, "healthy"
+        logger.info(f"[WATCHDOG] Re-confirmation burst check {i+1}/{DEATH_CONFIRMATION_CHECKS} — still no live PID")
 
-    logger.warning(f"[WATCHDOG] Roblox closed (no confirmed-alive PID for {int(time_since_pid)}s, activity={activity_state})")
+    # All re-confirmation checks failed — Roblox is genuinely dead
+    logger.warning(f"[WATCHDOG] Roblox confirmed closed after {DEATH_CONFIRMATION_CHECKS} re-confirmation checks (activity={activity_state})")
     return True, "process_closed"
 
 
@@ -600,6 +699,7 @@ def fast_disconnect_checker():
                     category = _classify_disconnect_text(matched)
                     logger.warning(f"[FAST] 2 consecutive OCR hits ({category}) — reconnecting")
                     state.stats[category] += 1
+                    _persist_stats()
                     reconnect_game(reason=f"ocr_disconnect_fast_{category}")
                     state.consecutive_ocr_hits = 0
             else:
@@ -792,19 +892,26 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 def main():
-    logger.info("[STARTUP] Reconnector API v9 starting...")
+    logger.info("[STARTUP] Reconnector API v10 starting...")
     print("")
     print("=" * 60)
     print(f"  API KEY (put this in the iOS app's settings):")
     print(f"  {API_KEY}")
     print("=" * 60)
     print("")
+
+    # Load persisted stats (with day-boundary reset) before anything else
+    persisted = _load_persisted_stats()
+    state.stats = persisted["stats"]
+    logger.info(f"[STARTUP] Loaded stats: {state.stats}")
+
     # Start background system info refresher FIRST so status endpoint is fast
     threading.Thread(target=refresh_system_info_loop, daemon=True).start()
     # Give the refresher a moment to populate initial values
     time.sleep(2)
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=fast_disconnect_checker, daemon=True).start()
+    threading.Thread(target=day_rollover_loop, daemon=True).start()
     server = ThreadedHTTPServer((HOST, PORT), RequestHandler)
     logger.info(f"[STARTUP] Server running on http://{HOST}:{PORT}")
     logger.info("[STARTUP] All systems online.")
@@ -813,6 +920,17 @@ def main():
     except KeyboardInterrupt:
         logger.info("[SHUTDOWN] Stopped")
         server.shutdown()
+
+
+def day_rollover_loop():
+    """Check for date rollover every 5 minutes; reset stats if the day changed."""
+    logger.info("[STARTUP] Day-rollover checker started (5 min interval)")
+    while True:
+        time.sleep(300)
+        try:
+            _check_day_rollover()
+        except Exception as e:
+            logger.error(f"[ROLLOVER] Error: {e}")
 
 
 if __name__ == "__main__":
