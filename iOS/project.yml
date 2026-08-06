@@ -43,7 +43,6 @@ targets:
         # Injects version + build + timestamp so every IPA has a unique
         # home-screen name — prevents iOS "(1)" duplicates when sideloading.
         script: |
-          set -e
           APP_PATH="${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app"
           PLIST="${APP_PATH}/Info.plist"
           if [ ! -f "$PLIST" ]; then
@@ -54,6 +53,10 @@ targets:
           BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$PLIST")
           STAMP=$(date +%y%m%d-%H%M)
           DISPLAY="Reconnector ${VERSION} (${BUILD}) ${STAMP}"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName ${DISPLAY}" "$PLIST"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleName ${DISPLAY}" "$PLIST"
+          # Delete-then-Add is the safe upsert pattern for PlistBuddy
+          /usr/libexec/PlistBuddy -c "Delete :CFBundleDisplayName" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string ${DISPLAY}" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Delete :CFBundleName" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleName string ${DISPLAY}" "$PLIST"
           echo "[stamp-name] Display name set to: ${DISPLAY}"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$PLIST"
